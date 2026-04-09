@@ -255,6 +255,19 @@ curl -X POST http://127.0.0.1:8002/generate \
 
 An IDE-friendly HTTP client example is available at [examples/omnivoice_api.http](examples/omnivoice_api.http).
 
+For Vast.ai-style startup hooks, a ready-to-use script is available at
+[vast_startup.sh](vast_startup.sh). By default it:
+
+- pulls the latest repo changes when safe
+- runs `uv sync`
+- starts `omnivoice-api` on port `8002`
+
+You can switch to the demo UI with:
+
+```bash
+OMNIVOICE_SERVER_MODE=demo ./vast_startup.sh
+```
+
 ### Single Inference
 
 ```bash
