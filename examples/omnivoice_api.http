@@ -1,0 +1,98 @@
+@base_url = http://127.0.0.1:8002
+@ref_audio_path = ./ref.wav
+
+### Health
+GET {{base_url}}/health
+Accept: application/json
+
+### Languages
+GET {{base_url}}/languages
+Accept: application/json
+
+### Generate - Auto Voice
+POST {{base_url}}/generate
+Content-Type: multipart/form-data; boundary=OmniVoiceBoundary
+
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="mode"
+
+auto
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="text"
+
+Hello from the OmniVoice API.
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="language"
+
+English
+--OmniVoiceBoundary--
+
+### Generate - Voice Design
+POST {{base_url}}/generate
+Content-Type: multipart/form-data; boundary=OmniVoiceBoundary
+
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="mode"
+
+design
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="text"
+
+Hello from the OmniVoice API.
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="language"
+
+English
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="instruct"
+
+female, british accent
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="num_step"
+
+32
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="guidance_scale"
+
+2.0
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="denoise"
+
+true
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="preprocess_prompt"
+
+true
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="postprocess_output"
+
+true
+--OmniVoiceBoundary--
+
+### Generate - Voice Clone
+# Update @ref_audio_path above before running this request.
+POST {{base_url}}/generate
+Content-Type: multipart/form-data; boundary=OmniVoiceBoundary
+
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="mode"
+
+clone
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="text"
+
+Hello from the OmniVoice API.
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="language"
+
+English
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="ref_text"
+
+Hello from the reference audio.
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="ref_audio"; filename="ref.wav"
+Content-Type: audio/wav
+
+< {{ref_audio_path}}
+--OmniVoiceBoundary--

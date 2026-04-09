@@ -25,6 +25,8 @@ Usage:
 
 import argparse
 import logging
+import signal
+import time
 from typing import Any, Dict
 
 import gradio as gr
@@ -144,6 +146,27 @@ def build_parser() -> argparse.ArgumentParser:
         " will be unavailable.",
     )
     return parser
+
+
+def _install_shutdown_handlers(shutdown_fn):
+    previous_handlers = {}
+
+    def _handle_signal(signum, frame):
+        signame = signal.Signals(signum).name
+        logging.info("Received %s, shutting down OmniVoice demo ...", signame)
+        shutdown_fn()
+        raise KeyboardInterrupt
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[sig] = signal.getsignal(sig)
+        signal.signal(sig, _handle_signal)
+
+    return previous_handlers
+
+
+def _restore_shutdown_handlers(previous_handlers):
+    for sig, handler in previous_handlers.items():
+        signal.signal(sig, handler)
 
 
 # ---------------------------------------------------------------------------
@@ -511,30 +534,55 @@ def main(argv=None) -> int:
     )
     parser = build_parser()
     args = parser.parse_args(argv)
+    demo_holder = {"demo": None, "closed": False}
 
-    device = args.device or get_best_device()
+    def shutdown_demo():
+        demo = demo_holder["demo"]
+        if demo is None or demo_holder["closed"]:
+            return
+        demo_holder["closed"] = True
+        try:
+            demo.close()
+        except Exception:
+            logging.exception("Failed to close OmniVoice demo cleanly.")
 
-    checkpoint = args.model
-    if not checkpoint:
-        parser.print_help()
-        return 0
-    logging.info(f"Loading model from {checkpoint}, device={device} ...")
-    model = OmniVoice.from_pretrained(
-        checkpoint,
-        device_map=device,
-        dtype=torch.float16,
-        load_asr=not args.no_asr,
-    )
-    print("Model loaded.")
+    previous_handlers = _install_shutdown_handlers(shutdown_demo)
 
-    demo = build_demo(model, checkpoint)
+    try:
+        device = args.device or get_best_device()
 
-    demo.queue().launch(
-        server_name=args.ip,
-        server_port=args.port,
-        share=args.share,
-        root_path=args.root_path,
-    )
+        checkpoint = args.model
+        if not checkpoint:
+            parser.print_help()
+            return 0
+        logging.info(f"Loading model from {checkpoint}, device={device} ...")
+        model = OmniVoice.from_pretrained(
+            checkpoint,
+            device_map=device,
+            dtype=torch.float16,
+            load_asr=not args.no_asr,
+        )
+        print("Model loaded.")
+
+        demo = build_demo(model, checkpoint)
+        demo_holder["demo"] = demo
+
+        demo.queue().launch(
+            server_name=args.ip,
+            server_port=args.port,
+            share=args.share,
+            root_path=args.root_path,
+            prevent_thread_lock=True,
+        )
+
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        logging.info("OmniVoice demo stopped.")
+    finally:
+        shutdown_demo()
+        _restore_shutdown_handlers(previous_handlers)
+
     return 0
 
 

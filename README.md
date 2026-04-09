@@ -209,11 +209,12 @@ audio = model.generate(text="He plays the [B EY1 S] guitar while catching a [B A
 
 ## Command-Line Tools
 
-Three CLI entry points are provided. The CLI tools support all features available in the Python API (voice cloning, voice design, auto voice, generation parameters, etc.) — all controlled via command-line arguments.
+Four CLI entry points are provided. The CLI tools support all features available in the Python API (voice cloning, voice design, auto voice, generation parameters, etc.) — all controlled via command-line arguments.
 
 | Command | Description | Source |
 |---|---|---|
 | `omnivoice-demo` | Interactive Gradio web demo | [omnivoice/cli/demo.py](omnivoice/cli/demo.py) |
+| `omnivoice-api` | FastAPI server with `/health`, `/languages`, and `/generate` | [omnivoice/cli/api_server.py](omnivoice/cli/api_server.py) |
 | `omnivoice-infer` | Single-item inference | [omnivoice/cli/infer.py](omnivoice/cli/infer.py) |
 | `omnivoice-infer-batch` | Batch inference across multiple GPUs | [omnivoice/cli/infer_batch.py](omnivoice/cli/infer_batch.py) |
 
@@ -224,6 +225,35 @@ omnivoice-demo --ip 0.0.0.0 --port 8001
 ```
 
 Provides a web UI for voice cloning and voice design. See `omnivoice-demo --help` for all options.
+
+### API Server
+
+```bash
+omnivoice-api --ip 0.0.0.0 --port 8002
+```
+
+The API server exposes three endpoints:
+
+- `GET /health`
+- `GET /languages`
+- `POST /generate`
+
+`POST /generate` accepts multipart form fields:
+`mode=auto|design|clone`, `text`, `language`, `instruct`, `ref_text`,
+`num_step`, `guidance_scale`, `speed`, `duration`, `denoise`,
+`preprocess_prompt`, `postprocess_output`, and optional uploaded `ref_audio`.
+
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:8002/generate \
+  -F mode=design \
+  -F text="Hello from OmniVoice" \
+  -F instruct="female, british accent" \
+  --output out.wav
+```
+
+An IDE-friendly HTTP client example is available at [examples/omnivoice_api.http](examples/omnivoice_api.http).
 
 ### Single Inference
 
