@@ -168,6 +168,63 @@ A third-party Hugging Face repo, `Gigsu/vocoloco-onnx`, appears to provide an ON
 
 This is the best starting point for a phone experiment because it avoids porting this Python repo directly.
 
+### TensorRT
+
+Not a useful route for the React Native phone app.
+
+TensorRT is NVIDIA's inference optimizer/runtime for NVIDIA GPUs. It is useful when the deployment target has NVIDIA CUDA-capable hardware, such as a server GPU or some NVIDIA edge devices. Normal iPhones and Android phones do not have NVIDIA CUDA GPUs.
+
+Where TensorRT could help:
+
+- Server-side OmniVoice on a Vast.ai-style NVIDIA GPU instance.
+- Possibly NVIDIA Jetson-style edge hardware.
+
+Where TensorRT does not help:
+
+- Running OmniVoice locally inside a normal iPhone app.
+- Running OmniVoice locally inside a normal Android phone app.
+
+For this project, TensorRT is worth considering only if the goal changes to making the server cheaper/faster. It is not the right path for local React Native smartphone inference.
+
+### Core ML
+
+Core ML is the Apple-native route for iPhone inference.
+
+Using Core ML could be faster than plain ONNX Runtime CPU inference because Core ML can use Apple hardware backends such as CPU, GPU, and the Neural Engine when the model graph is supported. However, converting OmniVoice to Core ML is not a simple one-step conversion.
+
+Likely challenges:
+
+- The repo is not one static model graph. It is a full Python inference pipeline.
+- The main model is a custom Hugging Face `PreTrainedModel` wrapper around a Qwen3-style LLM.
+- Generation uses an iterative decoding loop, not a single forward pass.
+- Classifier-free guidance doubles conditional/unconditional passes.
+- The pipeline also needs a text tokenizer and audio tokenizer/decoder.
+- Dynamic sequence lengths, masks, attention patterns, and custom post-processing may not export cleanly.
+- Voice cloning adds reference audio encoding and possibly ASR.
+
+The most realistic Core ML strategy is not "convert the whole repo." It is to split the pipeline:
+
+- Keep the text/token generation orchestration in native code or a React Native native module.
+- Convert the heavy neural pieces first, likely the main model and audio decoder/tokenizer path.
+- Avoid Whisper ASR and avoid voice cloning initially.
+- Start with auto/design voice only.
+- Use short fixed-shape test cases first, then expand once latency and memory are understood.
+
+### ONNX vs Core ML
+
+ONNX by itself is a model format and portability layer. It does not guarantee that the model will run fast on a phone. Speed depends on the runtime and execution provider.
+
+Relevant paths:
+
+- ONNX Runtime CPU only: easiest to try, but probably too slow for OmniVoice real-time on iPhone 12 Pro.
+- ONNX Runtime React Native: useful for wiring the benchmark into a React Native app.
+- ONNX Runtime with CoreML Execution Provider on iOS: can route supported ONNX subgraphs through Core ML, which may use Apple acceleration.
+- Direct Core ML `.mlpackage`: most iOS-native route and likely the better final iPhone performance target if conversion works.
+
+Practical recommendation:
+
+Use ONNX first as the fastest experiment, especially because a third-party ONNX export candidate already exists. If it runs but is too slow, then try converting the heavy pieces to direct Core ML. For iPhone performance, the target should be direct Core ML or ONNX Runtime using the CoreML Execution Provider, not ONNX Runtime CPU-only.
+
 ## Recommended Prototype Plan
 
 1. Do not start with voice cloning.
