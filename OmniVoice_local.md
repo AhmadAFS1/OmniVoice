@@ -210,6 +210,83 @@ This is the best starting point for a phone experiment because it avoids porting
    - no severe thermal throttling after repeated use
    - acceptable quality at the fastest step count
 
+## Local MacBook Air Test Results
+
+Environment:
+
+- MacBook Air, 2022 Apple Silicon, `arm64`
+- Localhost API server with model kept loaded in memory
+- Device: `mps`
+- Mode: design voice
+- Instruct: `female, american accent`
+- `num_step=16`
+- API endpoint: `http://127.0.0.1:8002/generate`
+
+Important interpretation:
+
+- The CLI command `uv run omnivoice-infer ...` starts a fresh Python process each time, so it reloads weights from disk into memory every run.
+- The API server loads the model once, then keeps it warm for repeated requests.
+- The first ever model run downloaded about 2.45 GB of main model weights and about 817 MB for the audio tokenizer. Later runs used the Hugging Face cache and did not redownload the files.
+- The API server is the better latency test because it avoids repeated model load time.
+
+Short sentence tested:
+
+```text
+This is a short test of local text to speech.
+```
+
+Command:
+
+```bash
+curl -X POST http://127.0.0.1:8002/generate \
+  -F mode=design \
+  -F text="This is a short test of local text to speech." \
+  -F instruct="female, american accent" \
+  -F num_step=16 \
+  --output local_test.wav
+```
+
+Observed curl runs:
+
+| Run | Curl wall time | Received size | Notes |
+|---|---:|---:|---|
+| 1 | about 5 seconds | about 117 KB | warm API request |
+| 2 | about 4 seconds | about 120 KB | warm API request |
+| 3 | about 4 seconds | about 132 KB | warm API request |
+
+The retained `local_test.wav` from the last short run measured:
+
+| File | Audio duration | Sample rate | Format | Approx RTF |
+|---|---:|---:|---|---:|
+| `local_test.wav` | 2.82 seconds | 24000 Hz | WAV PCM 16-bit | about 1.42 |
+
+Longer sentence tested:
+
+```text
+Today I am testing whether OmniVoice can generate natural sounding speech quickly enough for a mobile app, while keeping the voice clear, expressive, and stable across a longer sentence.
+```
+
+Command:
+
+```bash
+curl -X POST http://127.0.0.1:8002/generate \
+  -F mode=design \
+  -F text="Today I am testing whether OmniVoice can generate natural sounding speech quickly enough for a mobile app, while keeping the voice clear, expressive, and stable across a longer sentence." \
+  -F instruct="female, american accent" \
+  -F num_step=16 \
+  --output local_test_10sec.wav
+```
+
+Observed curl result:
+
+| File | Curl wall time | Received size | Audio duration | Sample rate | Format | Approx RTF |
+|---|---:|---:|---:|---:|---|---:|
+| `local_test_10sec.wav` | about 22 seconds | about 494 KB | 10.55 seconds | 24000 Hz | WAV PCM 16-bit | about 2.09 |
+
+Takeaway:
+
+The warm local API path is much faster than repeatedly running the CLI, but this 2022 MacBook Air still did not reach real-time at `num_step=16` in these tests. The short sentence was around 1.4x real time, and the longer sentence was around 2.1x real time. This increases the risk for on-device phone inference unless the ONNX/mobile runtime path gives a large optimization win or the app accepts lower quality settings.
+
 ## Recommended Product Strategy
 
 For production quality today, keep OmniVoice server-side.
@@ -251,4 +328,3 @@ External:
 - OmniVoice paper: https://arxiv.org/abs/2604.00688
 - ONNX Runtime React Native docs: https://onnxruntime.ai/docs/get-started/with-javascript/react-native.html
 - Third-party ONNX export candidate: https://huggingface.co/Gigsu/vocoloco-onnx
-
