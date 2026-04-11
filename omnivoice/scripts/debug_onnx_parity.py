@@ -22,6 +22,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--text", required=True)
     parser.add_argument("--instruct", default=None)
     parser.add_argument("--provider", choices=["auto", "cpu", "coreml"], default="cpu")
+    parser.add_argument(
+        "--allow-fixed-padding",
+        action="store_true",
+        default=False,
+        help="Allow fixed-shape ONNX exports to pad shorter requests up to the exported seq-len.",
+    )
     return parser
 
 
@@ -120,7 +126,11 @@ def main(argv=None) -> int:
         attn_implementation="eager",
     )
     wrapper = OmniVoiceBackboneForOnnx(model).eval()
-    ort = OnnxBackboneSession.create(args.onnx_backbone, provider=args.provider)
+    ort = OnnxBackboneSession.create(
+        args.onnx_backbone,
+        provider=args.provider,
+        allow_fixed_shape_padding=args.allow_fixed_padding,
+    )
 
     batch_input_ids, batch_audio_mask, batch_attention_mask = _build_batch(
         model,

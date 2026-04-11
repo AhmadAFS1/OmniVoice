@@ -77,6 +77,7 @@ class OnnxBackboneSession:
     providers: list[str]
     fixed_batch_size: int | None
     fixed_seq_len: int | None
+    allow_fixed_shape_padding: bool
     input_names: dict[str, str]
     output_name: str
 
@@ -85,6 +86,7 @@ class OnnxBackboneSession:
         cls,
         onnx_path: str,
         provider: ProviderPreference = "auto",
+        allow_fixed_shape_padding: bool = False,
     ) -> "OnnxBackboneSession":
         try:
             import onnxruntime as ort
@@ -122,6 +124,7 @@ class OnnxBackboneSession:
             providers=session.get_providers(),
             fixed_batch_size=_maybe_int_dim(batch_shape),
             fixed_seq_len=_maybe_int_dim(seq_shape),
+            allow_fixed_shape_padding=allow_fixed_shape_padding,
             input_names={
                 "input_ids": "input_ids",
                 "audio_mask": "audio_mask",
@@ -133,9 +136,46 @@ class OnnxBackboneSession:
     def supports(self, batch_size: int, seq_len: int) -> bool:
         if self.fixed_batch_size is not None and batch_size != self.fixed_batch_size:
             return False
-        if self.fixed_seq_len is not None and seq_len != self.fixed_seq_len:
+        if self.fixed_seq_len is not None:
+            if seq_len == self.fixed_seq_len:
+                return True
+            if self.allow_fixed_shape_padding and seq_len < self.fixed_seq_len:
+                return True
             return False
         return True
+
+    def _pad_inputs_to_fixed_seq_len(
+        self,
+        input_ids: torch.Tensor,
+        audio_mask: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        target_seq_len = self.fixed_seq_len
+        current_seq_len = int(input_ids.shape[-1])
+        if target_seq_len is None or current_seq_len >= target_seq_len:
+            return input_ids, audio_mask, attention_mask
+
+        padded_input_ids = torch.zeros(
+            (input_ids.shape[0], input_ids.shape[1], target_seq_len),
+            dtype=input_ids.dtype,
+        )
+        padded_input_ids[:, :, :current_seq_len] = input_ids
+
+        padded_audio_mask = torch.zeros(
+            (audio_mask.shape[0], target_seq_len),
+            dtype=audio_mask.dtype,
+        )
+        padded_audio_mask[:, :current_seq_len] = audio_mask
+
+        padded_attention_mask = torch.zeros(
+            (attention_mask.shape[0], 1, target_seq_len, target_seq_len),
+            dtype=attention_mask.dtype,
+        )
+        padded_attention_mask[:, :, :current_seq_len, :current_seq_len] = attention_mask
+        pad_diag = torch.arange(current_seq_len, target_seq_len)
+        padded_attention_mask[:, :, pad_diag, pad_diag] = True
+
+        return padded_input_ids, padded_audio_mask, padded_attention_mask
 
     def run(
         self,
@@ -147,12 +187,24 @@ class OnnxBackboneSession:
             raise RuntimeError("ONNX Runtime backbone expects CPU tensors as inputs.")
 
         batch_size = int(input_ids.shape[0])
-        seq_len = int(input_ids.shape[-1])
+        original_seq_len = int(input_ids.shape[-1])
+        seq_len = original_seq_len
         if not self.supports(batch_size=batch_size, seq_len=seq_len):
             raise RuntimeError(
                 f"ONNX backbone export at {self.path} does not support batch_size={batch_size}, "
                 f"seq_len={seq_len}. Fixed batch={self.fixed_batch_size}, "
                 f"fixed seq_len={self.fixed_seq_len}."
+            )
+
+        if (
+            self.fixed_seq_len is not None
+            and self.allow_fixed_shape_padding
+            and original_seq_len < self.fixed_seq_len
+        ):
+            input_ids, audio_mask, attention_mask = self._pad_inputs_to_fixed_seq_len(
+                input_ids=input_ids,
+                audio_mask=audio_mask,
+                attention_mask=attention_mask,
             )
 
         ort_inputs = {
@@ -168,6 +220,8 @@ class OnnxBackboneSession:
         }
 
         outputs = self.session.run([self.output_name], ort_inputs)[0]
+        if outputs.shape[2] != original_seq_len:
+            outputs = outputs[:, :, :original_seq_len, :]
         return torch.from_numpy(outputs.astype(np.float32, copy=False))
 
 

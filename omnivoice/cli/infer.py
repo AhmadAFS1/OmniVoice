@@ -129,6 +129,12 @@ def get_parser() -> argparse.ArgumentParser:
         help="Provider preference when --onnx_backbone is set.",
     )
     parser.add_argument(
+        "--onnx_backbone_allow_fixed_padding",
+        type=str2bool,
+        default=False,
+        help="Allow fixed-shape ONNX backbone exports to pad shorter requests up to the exported seq-len.",
+    )
+    parser.add_argument(
         "--onnx_decoder",
         type=str,
         default=None,
@@ -157,11 +163,16 @@ def main():
     )
     if args.onnx_backbone:
         logging.info(
-            "Loading ONNX backbone from %s with provider=%s ...",
+            "Loading ONNX backbone from %s with provider=%s (allow_fixed_padding=%s) ...",
             args.onnx_backbone,
             args.onnx_provider,
+            args.onnx_backbone_allow_fixed_padding,
         )
-        model.load_onnx_backbone(args.onnx_backbone, provider=args.onnx_provider)
+        model.load_onnx_backbone(
+            args.onnx_backbone,
+            provider=args.onnx_provider,
+            allow_fixed_shape_padding=args.onnx_backbone_allow_fixed_padding,
+        )
     if args.onnx_decoder:
         logging.info(
             "Loading ONNX decoder from %s with provider=%s ...",

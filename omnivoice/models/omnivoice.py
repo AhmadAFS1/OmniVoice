@@ -32,6 +32,7 @@ import logging
 import math
 import os
 import re
+import time
 from dataclasses import dataclass, fields
 from functools import partial
 from typing import Any, List, Optional, Union
@@ -229,6 +230,9 @@ class OmniVoice(PreTrainedModel):
         self._onnx_decoder = None
         self._onnx_fallback_messages = set()
         self._onnx_decoder_fallback_messages = set()
+        self._last_backbone_runtime_sec = 0.0
+        self._last_decoder_runtime_sec = 0.0
+        self._last_generation_profile = None
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
@@ -291,6 +295,7 @@ class OmniVoice(PreTrainedModel):
         self,
         onnx_path: str,
         provider: str = "auto",
+        allow_fixed_shape_padding: bool = False,
     ) -> None:
         """Load a phase-1 ONNX Runtime backbone session.
 
@@ -300,14 +305,19 @@ class OmniVoice(PreTrainedModel):
         """
         from omnivoice.utils.onnx_runtime import OnnxBackboneSession
 
-        self._onnx_backbone = OnnxBackboneSession.create(onnx_path, provider=provider)
+        self._onnx_backbone = OnnxBackboneSession.create(
+            onnx_path,
+            provider=provider,
+            allow_fixed_shape_padding=allow_fixed_shape_padding,
+        )
         self._onnx_fallback_messages.clear()
         logger.info(
-            "Loaded ONNX backbone from %s with providers=%s (fixed_batch=%s, fixed_seq_len=%s)",
+            "Loaded ONNX backbone from %s with providers=%s (fixed_batch=%s, fixed_seq_len=%s, allow_fixed_shape_padding=%s)",
             onnx_path,
             self._onnx_backbone.providers,
             self._onnx_backbone.fixed_batch_size,
             self._onnx_backbone.fixed_seq_len,
+            self._onnx_backbone.allow_fixed_shape_padding,
         )
 
     def unload_onnx_backbone(self) -> None:
@@ -357,8 +367,13 @@ class OmniVoice(PreTrainedModel):
         if self._onnx_backbone is None:
             return False
         if not self._onnx_backbone.supports(batch_size=batch_size, seq_len=seq_len):
-            self._log_onnx_fallback_once(
+            padding_hint = (
                 "export shape mismatch; fixed-shape exports require an exact batch/sequence match"
+                if not self._onnx_backbone.allow_fixed_shape_padding
+                else "export shape mismatch; request is larger than the loaded fixed-shape ONNX backbone"
+            )
+            self._log_onnx_fallback_once(
+                padding_hint
             )
             return False
         return True
@@ -632,7 +647,18 @@ class OmniVoice(PreTrainedModel):
         )
 
         self.eval()
+        generation_start = time.perf_counter()
+        profile = {
+            "preprocess_sec": 0.0,
+            "iterative_sec": 0.0,
+            "chunked_sec": 0.0,
+            "decode_sec": 0.0,
+            "postprocess_sec": 0.0,
+            "backbone_sec": 0.0,
+            "decoder_sec": 0.0,
+        }
 
+        preprocess_start = time.perf_counter()
         full_task = self._preprocess_all(
             text=text,
             language=language,
@@ -644,6 +670,7 @@ class OmniVoice(PreTrainedModel):
             speed=speed,
             duration=duration,
         )
+        profile["preprocess_sec"] += time.perf_counter() - preprocess_start
 
         short_idx, long_idx = full_task.get_indices(
             gen_config, self.audio_tokenizer.config.frame_rate
@@ -653,24 +680,47 @@ class OmniVoice(PreTrainedModel):
 
         if short_idx:
             short_task = full_task.slice_task(short_idx)
+            iterative_start = time.perf_counter()
             short_results = self._generate_iterative(short_task, gen_config)
+            profile["iterative_sec"] += time.perf_counter() - iterative_start
             for idx, res in zip(short_idx, short_results):
                 results[idx] = res
 
         if long_idx:
             long_task = full_task.slice_task(long_idx)
+            chunked_start = time.perf_counter()
             long_results = self._generate_chunked(long_task, gen_config)
+            profile["chunked_sec"] += time.perf_counter() - chunked_start
             for idx, res in zip(long_idx, long_results):
                 results[idx] = res
 
         generated_audios = []
         for i in range(full_task.batch_size):
             assert results[i] is not None, f"Result {i} was not generated"
-            generated_audios.append(
-                self._decode_and_post_process(
-                    results[i], full_task.ref_rms[i], gen_config  # type: ignore[arg-type]
-                )
+            generated_audio, decode_sec, postprocess_sec = self._decode_and_post_process(
+                results[i], full_task.ref_rms[i], gen_config  # type: ignore[arg-type]
             )
+            profile["decode_sec"] += decode_sec
+            profile["postprocess_sec"] += postprocess_sec
+            generated_audios.append(generated_audio)
+
+        profile["backbone_sec"] = float(self._last_backbone_runtime_sec)
+        profile["decoder_sec"] = float(self._last_decoder_runtime_sec)
+        profile["total_sec"] = time.perf_counter() - generation_start
+        profile["batch_size"] = full_task.batch_size
+        profile["num_step"] = gen_config.num_step
+        self._last_generation_profile = profile
+        logger.info(
+            "Generation profile total=%.3fs preprocess=%.3fs iterative=%.3fs chunked=%.3fs decode=%.3fs postprocess=%.3fs backbone=%.3fs decoder=%.3fs",
+            profile["total_sec"],
+            profile["preprocess_sec"],
+            profile["iterative_sec"],
+            profile["chunked_sec"],
+            profile["decode_sec"],
+            profile["postprocess_sec"],
+            profile["backbone_sec"],
+            profile["decoder_sec"],
+        )
 
         return generated_audios
 
@@ -780,7 +830,7 @@ class OmniVoice(PreTrainedModel):
         tokens: Union[torch.Tensor, List[torch.Tensor]],
         rms: Union[float, None],
         gen_config: OmniVoiceGenerationConfig,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, float, float]:
         """
         Args:
             tokens: Audio tokens — either a single tensor of shape
@@ -788,18 +838,25 @@ class OmniVoice(PreTrainedModel):
             rms: RMS of the reference audio for volume adjustment.
             gen_config: Generation config for post-processing options.
         Returns:
-            Decoded and post-processed audio tensor of shape (1, T).
+            Tuple of decoded/post-processed audio tensor of shape (1, T),
+            decoder runtime seconds, and post-process runtime seconds.
         """
         tokenizer_device = self.audio_tokenizer.device
+        decode_sec = 0.0
 
         def _decode_tokens(token_tensor: torch.Tensor) -> torch.Tensor:
+            nonlocal decode_sec
+            decode_start = time.perf_counter()
             if self._should_use_onnx_decoder(seq_len=int(token_tensor.size(-1))):
-                return self._onnx_decoder.run(token_tensor.unsqueeze(0).cpu())[0].cpu()
-            return (
+                decoded = self._onnx_decoder.run(token_tensor.unsqueeze(0).cpu())[0].cpu()
+            else:
+                decoded = (
                 self.audio_tokenizer.decode(token_tensor.to(tokenizer_device).unsqueeze(0))
                 .audio_values[0]
                 .cpu()
             )
+            decode_sec += time.perf_counter() - decode_start
+            return decoded
 
         if isinstance(tokens, list):
             chunk_audios = [_decode_tokens(t) for t in tokens]
@@ -807,11 +864,15 @@ class OmniVoice(PreTrainedModel):
         else:
             audio_waveform = _decode_tokens(tokens)
 
-        return self._post_process_audio(
+        postprocess_start = time.perf_counter()
+        postprocessed = self._post_process_audio(
             audio_waveform,
             postprocess_output=gen_config.postprocess_output,
             ref_rms=rms,
         )
+        postprocess_sec = time.perf_counter() - postprocess_start
+        self._last_decoder_runtime_sec = decode_sec
+        return postprocessed, decode_sec, postprocess_sec
 
     def _post_process_audio(
         self,
@@ -1331,8 +1392,10 @@ class OmniVoice(PreTrainedModel):
         layer_ids = torch.arange(
             self.config.num_audio_codebook, device=runtime_device
         ).view(1, -1, 1)
+        backbone_runtime_sec = 0.0
 
         for step in range(gen_config.num_step):
+            backbone_start = time.perf_counter()
             if use_onnx_backbone:
                 batch_logits = self._onnx_backbone.run(
                     input_ids=batch_input_ids,
@@ -1345,6 +1408,7 @@ class OmniVoice(PreTrainedModel):
                     audio_mask=batch_audio_mask,
                     attention_mask=batch_attention_mask,
                 ).logits.to(torch.float32)
+            backbone_runtime_sec += time.perf_counter() - backbone_start
 
             for i in range(B):
                 k = schedules[i][step]
@@ -1382,6 +1446,7 @@ class OmniVoice(PreTrainedModel):
                 batch_input_ids[i : i + 1, :, c_len - t_len : c_len] = sample_tokens
                 batch_input_ids[B + i : B + i + 1, :, :t_len] = sample_tokens
 
+        self._last_backbone_runtime_sec = backbone_runtime_sec
         return [tokens[i, :, : task.target_lens[i]] for i in range(B)]
 
     def _predict_tokens_with_scoring(self, c_logits, u_logits, gen_config):

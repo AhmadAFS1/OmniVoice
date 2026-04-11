@@ -109,6 +109,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Provider preference when --onnx-backbone is set.",
     )
     parser.add_argument(
+        "--onnx-backbone-allow-fixed-padding",
+        action="store_true",
+        default=False,
+        help="Allow fixed-shape ONNX backbone exports to pad shorter requests up to the exported seq-len.",
+    )
+    parser.add_argument(
         "--onnx-decoder",
         default=None,
         help="Optional ONNX decoder path for decoder-side ORT acceleration.",
@@ -189,6 +195,7 @@ def create_app(
     load_asr: bool = True,
     onnx_backbone: Optional[str] = None,
     onnx_provider: str = "auto",
+    onnx_backbone_allow_fixed_padding: bool = False,
     onnx_decoder: Optional[str] = None,
     onnx_decoder_provider: str = "auto",
     save_dir: Optional[str] = None,
@@ -205,11 +212,16 @@ def create_app(
     )
     if onnx_backbone:
         logger.info(
-            "Loading ONNX backbone from %s with provider=%s ...",
+            "Loading ONNX backbone from %s with provider=%s (allow_fixed_padding=%s) ...",
             onnx_backbone,
             onnx_provider,
+            onnx_backbone_allow_fixed_padding,
         )
-        model.load_onnx_backbone(onnx_backbone, provider=onnx_provider)
+        model.load_onnx_backbone(
+            onnx_backbone,
+            provider=onnx_provider,
+            allow_fixed_shape_padding=onnx_backbone_allow_fixed_padding,
+        )
     if onnx_decoder:
         logger.info(
             "Loading ONNX decoder from %s with provider=%s ...",
@@ -230,6 +242,9 @@ def create_app(
     app.state.generate_lock = Lock()
     app.state.onnx_backbone = onnx_backbone
     app.state.onnx_provider = onnx_provider if onnx_backbone else None
+    app.state.onnx_backbone_allow_fixed_padding = (
+        onnx_backbone_allow_fixed_padding if onnx_backbone else None
+    )
     app.state.onnx_decoder = onnx_decoder
     app.state.onnx_decoder_provider = (
         onnx_decoder_provider if onnx_decoder else None
@@ -246,6 +261,7 @@ def create_app(
             "asr_loaded": app.state.model._asr_pipe is not None,
             "onnx_backbone": app.state.onnx_backbone,
             "onnx_provider": app.state.onnx_provider,
+            "onnx_backbone_allow_fixed_padding": app.state.onnx_backbone_allow_fixed_padding,
             "onnx_decoder": app.state.onnx_decoder,
             "onnx_decoder_provider": app.state.onnx_decoder_provider,
             "onnx_runtime_providers": (
@@ -427,6 +443,7 @@ def main(argv=None) -> int:
         load_asr=not args.no_asr,
         onnx_backbone=args.onnx_backbone,
         onnx_provider=args.onnx_provider,
+        onnx_backbone_allow_fixed_padding=args.onnx_backbone_allow_fixed_padding,
         onnx_decoder=args.onnx_decoder,
         onnx_decoder_provider=args.onnx_decoder_provider,
         save_dir=args.save_dir,

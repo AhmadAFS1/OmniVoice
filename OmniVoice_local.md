@@ -1197,6 +1197,26 @@ What is still not true:
 - decoder CoreML parity is not yet as tight as CPU parity
 - the entire mobile runtime path is still not complete because clone-prompt encoding remains in PyTorch
 
+#### Fixed-shape bucket experiment (CoreML backbone)
+
+Status as of 2026-04-11: a fixed-shape `seq128` backbone running through CoreML EP shows a large latency improvement versus the dynamic-shape CoreML backbone on this MacBook Air.
+
+Fixed-shape backbone artifact:
+
+- `/Users/ahmadsmacair/OmniVoice/artifacts/onnx_fixed/seq128/omnivoice_backbone_bs2_seq128.onnx`
+
+Server notes:
+
+- User tested via a server on `http://127.0.0.1:8008`.
+- The server saved WAVs under: `/Users/ahmadsmacair/OmniVoice/local/api_outputs/onnx_fixed128/` (from `x-omnivoice-saved-path`).
+
+Measured design-mode timings (`num_step=16`):
+
+- Text: `Hello world.` -> `fixed128_total=3.629878`
+- Text: `This is a short test of local text to speech.` -> `fixed128_total=4.650628`
+
+One log line reported `dynamic_total=0.000482`, which is not plausible for real inference and is likely due to a curl formatting/line-continuation issue rather than an actual generation runtime.
+
 ### Phase 4: Native Apple deployment path
 
 Goal:
