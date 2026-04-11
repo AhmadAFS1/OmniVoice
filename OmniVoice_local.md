@@ -1214,6 +1214,11 @@ Measured design-mode timings (`num_step=16`):
 
 - Text: `Hello world.` -> `fixed128_total=3.629878`
 - Text: `This is a short test of local text to speech.` -> `fixed128_total=4.650628`
+- Text: `Today I am testing whether OmniVoice can generate natural sounding speech quickly enough for a mobile app, while keeping the voice clear, expressive, and stable across a longer sentence.` -> `fixed128_long=14.736434`
+
+Saved output for the long-sentence run:
+
+- `/Users/ahmadsmacair/OmniVoice/local/api_outputs/onnx_fixed128/20260411-162019_design_today-i-am-testing-whether-omnivoice-can_6a0ff71d.wav`
 
 One log line reported `dynamic_total=0.000482`, which is not plausible for real inference and is likely due to a curl formatting/line-continuation issue rather than an actual generation runtime.
 
@@ -1242,3 +1247,181 @@ The next implementation task is now:
 - revalidate clone mode with `ref_text` supplied and both ONNX artifacts loaded
 
 After that, the next decision is whether the decoder should stay on ORT CPU for fidelity, move to a better CoreML configuration, or be converted to a direct Core ML artifact outside ONNX Runtime.
+
+### Repo-wide codebase audit (2026-04-11)
+
+I audited the tracked repo files to answer a narrower question than "what does the project do": which parts actually matter for making OmniVoice fast enough and complete enough for iOS real-time inference.
+
+Scope:
+
+- audited tracked repo files (`rg --files` -> `85` files)
+- excluded environment/generated noise like `.venv/`, `__pycache__/`, and large generated artifacts when deciding what counts as the codebase
+
+#### What files actually control iOS inference feasibility
+
+These are the files that materially determine whether local Apple execution can become fast and mobile-ready:
+
+- `omnivoice/models/omnivoice.py`
+- `omnivoice/utils/onnx_runtime.py`
+- `omnivoice/models/onnx_backbone.py`
+- `omnivoice/models/onnx_decoder.py`
+- `omnivoice/cli/api_server.py`
+- `omnivoice/cli/infer.py`
+- `omnivoice/utils/audio.py`
+- `omnivoice/utils/text.py`
+- `omnivoice/utils/duration.py`
+- `omnivoice/utils/voice_design.py`
+- `omnivoice/utils/lang_map.py`
+- `omnivoice/scripts/export_onnx_backbone.py`
+- `omnivoice/scripts/export_onnx_decoder.py`
+- `omnivoice/scripts/debug_onnx_parity.py`
+- `omnivoice/scripts/debug_decoder_parity.py`
+- `scripts/export_coreml_backbone.py`
+- `scripts/export_audio_decoder.py`
+- `docs/ios_deployment_plan.md`
+
+Everything else in the repo is either:
+
+- training-only (`omnivoice/training/*`, `omnivoice/data/*`)
+- evaluation-only (`omnivoice/eval/*`)
+- dataset preparation (`omnivoice/scripts/extract_audio_tokens*.py`, `jsonl_to_webdataset.py`, `denoise_audio.py`)
+- examples/docs/config glue
+
+Those parts matter for training and benchmarking, but they are not the current blockers for iPhone inference.
+
+#### Main technical conclusion from the full audit
+
+The repo is still a Python-first inference system. Even after the ONNX work, the current mobile path is not "a converted model"; it is still a hybrid runtime whose control plane lives in Python.
+
+The bottleneck and blockers are now very clear:
+
+1. The repeated backbone call inside `_generate_iterative(...)` is still the dominant latency cost.
+2. Voice cloning is still not fully mobile-ready because prompt creation depends on PyTorch audio-token encoding, and clone mode without `ref_text` still depends on Whisper.
+3. The decoder is migrated to ONNX, but the best-fidelity path is still ORT CPU, not a clearly faster Apple-native decoder backend.
+4. The current direct Core ML export scripts in `scripts/` are prototype-level utilities, not a productionized deployment path.
+5. None of the Python-side orchestration has been reimplemented in Swift or a native mobile runtime yet.
+
+#### What the audit says about the current phases
+
+Phase 1:
+
+- effectively complete for design-mode quality parity
+- dynamic ONNX backbone fixed the bad-audio regression from padded fixed-shape export
+
+Phase 2:
+
+- partially complete
+- CoreML EP works
+- fixed-shape bucket experiments are now the first real sign of Apple-side throughput improvement
+
+Phase 3:
+
+- partially complete
+- decoder export exists and parity is strong on CPU ORT
+- clone mode is still not fully revalidated through the migrated path
+
+Phase 4:
+
+- not started as an actual native app/runtime
+- still only documented/analyzed
+
+#### The most important repo-level insight
+
+The fixed-shape bucket experiment is now the strongest lever in the whole codebase.
+
+Why:
+
+- profiling in `omnivoice/models/omnivoice.py` already showed the backbone dominates runtime
+- dynamic ONNX + CoreML preserved quality but stayed slow
+- fixed `seq128` CoreML brought latency much closer to PyTorch MPS for short prompts
+
+So the next performance phase should focus on the backbone shape strategy, not on post-processing, docs, training code, or evaluation code.
+
+#### Next steps, in order
+
+1. Formalize bucketed backbone exports and routing.
+
+   Build and benchmark a real bucket set:
+
+   - `seq128`
+   - `seq256`
+   - `seq384`
+   - `seq512`
+
+   Then route requests to the smallest valid bucket instead of relying on one dynamic export.
+
+   This is the highest-probability next speed win because the current `seq128` result already improved materially.
+
+2. Revalidate clone mode end to end on the migrated path.
+
+   Required test shape:
+
+   - ONNX/CoreML backbone
+   - ONNX decoder
+   - `ref_text` always supplied
+
+   Do not treat mobile clone mode as viable until this passes cleanly.
+
+3. Decide how clone prompt creation will work on device.
+
+   There are only two serious options:
+
+   - export and migrate the reference-audio encoder path too
+   - or precompute reusable clone prompts off-device/server-side
+
+   If on-device cloning is mandatory, this becomes a first-class migration task.
+
+4. Quantize the backbone and decoder.
+
+   Real iPhone deployment does not work with the current model sizes.
+
+   Quantization is not optional if the goal is on-device inference with reasonable memory headroom.
+
+   Start with:
+
+   - backbone first
+   - INT8 before more aggressive compression
+   - parity and listening checks after each change
+
+5. Compare ORT CoreML EP against direct Core ML artifacts.
+
+   The repo now has enough evidence to justify this as a real decision point.
+
+   If ORT CoreML remains slower than expected after bucket routing and quantization, move the backbone to direct `.mlpackage` benchmarking instead of assuming ORT will eventually catch up.
+
+6. Build a minimal native iOS harness before touching React Native integration.
+
+   The first native test should do only this:
+
+   - tokenize text
+   - build the prompt
+   - run the iterative loop
+   - decode waveform
+   - measure wall time, memory, and first-audio latency
+
+   React Native should come after the native runtime path is proven, not before.
+
+#### What should not be the focus right now
+
+These are not the next bottlenecks according to the repo audit:
+
+- training code changes
+- evaluation scripts
+- dataset tokenization scripts
+- API server features
+- post-processing tweaks
+- Gradio/demo work
+
+Those files are not what is keeping iPhone real-time from happening.
+
+#### Practical roadmap after this audit
+
+The next implementation path should be:
+
+1. bucketed fixed-shape CoreML backbone routing
+2. clone-mode revalidation on the migrated path
+3. quantization experiments
+4. direct Core ML vs ORT CoreML decision
+5. native iOS harness
+
+That is now the cleanest path to answer the real question: can OmniVoice become fast enough on iPhone without breaking voice quality or clone behavior.
