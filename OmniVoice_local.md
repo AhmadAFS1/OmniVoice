@@ -325,30 +325,33 @@ That does not mean React Native yet. It just means the localhost Python benchmar
 
 Dynamic shapes may work, but the CoreML Execution Provider documentation notes that dynamic shapes can hurt performance. If the first dynamic-shape export works but is not fast enough, the next optimization should be bucketed static-shape exports such as fixed sequence lengths.
 
-### Likely implementation phases
+### Current phase map
 
 Phase 1:
 
 - Export backbone to ONNX.
 - Add a localhost Python ONNX Runtime backend.
-- Keep decoder in PyTorch.
-- Keep voice cloning prompt creation in PyTorch.
-- Benchmark localhost throughput versus current MPS PyTorch.
+- Fix parity and audio quality.
+- Status: done enough to move forward. Dynamic-sequence ONNX restored quality parity for the backbone path.
 
 Phase 2:
 
-- Export decoder to ONNX if backbone-only ORT shows a worthwhile speedup.
-- Compare end-to-end throughput again.
+- Make Apple-accelerated ONNX work through CoreMLExecutionProvider.
+- Re-check parity and localhost throughput.
+- Status: working, but still slower than PyTorch + MPS on this 2022 MacBook Air.
 
 Phase 3:
 
-- Optimize for CoreML Execution Provider or static-shape buckets.
-- Then consider React Native integration.
+- Remove the remaining inference-time PyTorch dependency from the hot path.
+- Export and validate the audio decoder.
+- Keep clone mode in scope, with `ref_text` required so Whisper stays out of the runtime path.
+- Target outcome: a full neural inference path that can run without PyTorch at request time.
 
 Phase 4:
 
-- Only after the localhost path is proven, revisit mobile integration.
-- If needed, export or replace the voice-clone prompt encoder too.
+- Build the first true mobile-style runtime harness.
+- Compare ONNX Runtime Mobile versus direct Core ML packaging for the migrated models.
+- Benchmark on a real iPhone instead of inferring from the Mac.
 
 ### Expected benefit and risk
 
@@ -1018,3 +1021,204 @@ So the current Apple-side ranking on this Mac is:
 4. ONNX Runtime + CPU
 
 The next likely optimization path is no longer “fix CoreML EP”. That part is now working. The next question is whether direct Core ML conversion of the backbone and decoder can beat the hybrid ORT path, or whether the PyTorch/MPS path simply remains the best Mac-local option while the iPhone path is built separately.
+
+## Current Plan
+
+As of 2026-04-11, the project is no longer blocked on ONNX quality or CoreML EP bring-up. The next work should focus on replacing the remaining PyTorch inference pieces and then validating a true mobile-style stack.
+
+### What is done
+
+- Dynamic ONNX backbone export works.
+- Fixed-shape padding is no longer the accepted path.
+- ONNX Runtime parity is good enough for design-mode audio quality.
+- CoreMLExecutionProvider is active for the dynamic backbone.
+
+### What is still missing
+
+- The audio decoder no longer has to run in PyTorch; an ONNX Runtime path now exists, but it still needs more end-to-end validation in clone mode and more throughput testing.
+- Voice-clone prompt creation still runs in PyTorch.
+- The current server is still hybrid, not a real iOS deployment path.
+- CoreML-backed ONNX is still slower than PyTorch + MPS on this Mac.
+
+### Phase 3: Full inference-path migration
+
+Goal:
+
+- Remove PyTorch from the inference-critical neural path.
+
+Implementation steps:
+
+1. Export the Higgs audio decoder as its own model artifact.
+2. Add a runtime path that can execute the decoder without PyTorch.
+3. Validate decoder parity against the current PyTorch decoder with fixed token inputs.
+4. Re-run end-to-end design-mode tests with both backbone and decoder migrated.
+5. Re-run clone-mode tests with `ref_text` always supplied.
+
+Exit criteria:
+
+- End-to-end audio quality remains aligned with the current PyTorch baseline.
+- The request path no longer depends on PyTorch for backbone or decoder execution.
+
+### Phase 3 status as of 2026-04-11
+
+The decoder export and parity task is now implemented.
+
+What was added:
+
+- `omnivoice/models/onnx_decoder.py`
+- `omnivoice/scripts/export_onnx_decoder.py`
+- `omnivoice/scripts/debug_decoder_parity.py`
+- runtime support in the model, CLI, and API for `--onnx-decoder`
+
+The decoder can now be loaded independently from the backbone:
+
+```bash
+/Users/ahmadsmacair/OmniVoice/.venv/bin/python -m omnivoice.cli.infer \
+  --model k2-fsa/OmniVoice \
+  --device mps \
+  --onnx_backbone /Users/ahmadsmacair/OmniVoice/artifacts/onnx_dynamic/omnivoice_backbone_dynamic.onnx \
+  --onnx_provider coreml \
+  --onnx_decoder /Users/ahmadsmacair/OmniVoice/artifacts/onnx_dynamic/omnivoice_decoder_dynamic.onnx \
+  --onnx_decoder_provider coreml \
+  --text "This is a short test of local text to speech." \
+  --instruct "female, american accent" \
+  --num_step 4 \
+  --output /Users/ahmadsmacair/OmniVoice/local/phase3_full_coreml.wav
+```
+
+#### Decoder export artifact
+
+Successful dynamic decoder export:
+
+```bash
+/Users/ahmadsmacair/OmniVoice/.venv/bin/python -m omnivoice.scripts.export_onnx_decoder \
+  --model k2-fsa/OmniVoice \
+  --output artifacts/onnx_dynamic/omnivoice_decoder_dynamic.onnx \
+  --seq-len 128 \
+  --dynamic-seq
+```
+
+Artifact:
+
+- `/Users/ahmadsmacair/OmniVoice/artifacts/onnx_dynamic/omnivoice_decoder_dynamic.onnx`
+
+#### Decoder parity validation
+
+CPU ORT parity is extremely tight.
+
+Command:
+
+```bash
+/Users/ahmadsmacair/OmniVoice/.venv/bin/python -m omnivoice.scripts.debug_decoder_parity \
+  --model k2-fsa/OmniVoice \
+  --onnx-decoder artifacts/onnx_dynamic/omnivoice_decoder_dynamic.onnx \
+  --provider cpu \
+  --save-prefix local/phase3_decoder_det
+```
+
+Result:
+
+```json
+{
+  "provider": "cpu",
+  "loaded_runtime_providers": ["CPUExecutionProvider"],
+  "random_codes": {
+    "pt_num_samples": 122880,
+    "ort_num_samples": 122880,
+    "shared_num_samples": 122880,
+    "max_abs": 0.00000370,
+    "mean_abs": 0.00000011
+  },
+  "generated_codes": {
+    "pt_num_samples": 63360,
+    "ort_num_samples": 63360,
+    "shared_num_samples": 63360,
+    "max_abs": 0.00001157,
+    "mean_abs": 0.00000018
+  },
+  "generated_token_seq_len": 66
+}
+```
+
+Saved WAVs for listening:
+
+- `/Users/ahmadsmacair/OmniVoice/local/phase3_decoder_det_pt.wav`
+- `/Users/ahmadsmacair/OmniVoice/local/phase3_decoder_det_ort.wav`
+
+Both files are valid `24000` Hz WAVs with the same duration:
+
+- `2.64s`
+
+#### CoreML EP note for the decoder
+
+The first CoreML decoder configuration was not numerically safe.
+
+- `ModelFormat=NeuralNetwork` with `MLComputeUnits=ALL` produced non-finite decoder output.
+
+The working decoder-side CoreML configuration is:
+
+- `ModelFormat=MLProgram`
+- `MLComputeUnits=ALL`
+- `RequireStaticInputShapes=1`
+- `EnableOnSubgraphs=0`
+
+With that configuration, CoreML-backed decoder output becomes finite and reasonably close:
+
+```json
+{
+  "provider": "coreml",
+  "loaded_runtime_providers": ["CoreMLExecutionProvider", "CPUExecutionProvider"],
+  "random_codes": {
+    "max_abs": 0.01199312,
+    "mean_abs": 0.00033379
+  },
+  "generated_codes": {
+    "max_abs": 0.02624599,
+    "mean_abs": 0.00049674
+  }
+}
+```
+
+That is materially worse than CPU ORT parity, so the decoder-side CoreML path should still be treated as in-progress rather than fully trusted for production audio judgments.
+
+#### Phase 3 checkpoint
+
+What is now true:
+
+- the decoder has a productionized ONNX export path
+- the runtime can execute the decoder without PyTorch
+- the CLI and API can load the decoder independently
+- CPU decoder parity is strong enough to trust as a migration step
+- one full design-mode inference run with both ONNX backbone and ONNX decoder loaded completed successfully
+
+What is still not true:
+
+- clone mode has not yet been revalidated end to end with the ONNX decoder path
+- decoder CoreML parity is not yet as tight as CPU parity
+- the entire mobile runtime path is still not complete because clone-prompt encoding remains in PyTorch
+
+### Phase 4: Native Apple deployment path
+
+Goal:
+
+- Build the first realistic iPhone deployment candidate.
+
+Implementation steps:
+
+1. Decide whether to keep ONNX Runtime Mobile or move the backbone and decoder to direct Core ML artifacts.
+2. Build a minimal native harness that loads the migrated models and runs one full generation request.
+3. Measure wall time, first-audio latency, memory use, and thermal behavior on a real iPhone.
+4. Only after that, design the React Native bridge around the winning runtime path.
+
+Exit criteria:
+
+- One end-to-end prompt works on-device without Python.
+- Backbone, decoder, and clone-critical runtime pieces are all available in the chosen mobile stack.
+
+### Immediate next task
+
+The next implementation task is now:
+
+- revalidate clone mode with `ref_text` supplied and both ONNX artifacts loaded
+
+After that, the next decision is whether the decoder should stay on ORT CPU for fidelity, move to a better CoreML configuration, or be converted to a direct Core ML artifact outside ONNX Runtime.

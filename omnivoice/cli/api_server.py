@@ -109,6 +109,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Provider preference when --onnx-backbone is set.",
     )
     parser.add_argument(
+        "--onnx-decoder",
+        default=None,
+        help="Optional ONNX decoder path for decoder-side ORT acceleration.",
+    )
+    parser.add_argument(
+        "--onnx-decoder-provider",
+        default="auto",
+        choices=["auto", "cpu", "coreml"],
+        help="Provider preference when --onnx-decoder is set.",
+    )
+    parser.add_argument(
         "--save-dir",
         default=None,
         help="Optional directory to persist a copy of each generated WAV.",
@@ -178,6 +189,8 @@ def create_app(
     load_asr: bool = True,
     onnx_backbone: Optional[str] = None,
     onnx_provider: str = "auto",
+    onnx_decoder: Optional[str] = None,
+    onnx_decoder_provider: str = "auto",
     save_dir: Optional[str] = None,
 ) -> FastAPI:
     device = device or get_best_device()
@@ -197,6 +210,13 @@ def create_app(
             onnx_provider,
         )
         model.load_onnx_backbone(onnx_backbone, provider=onnx_provider)
+    if onnx_decoder:
+        logger.info(
+            "Loading ONNX decoder from %s with provider=%s ...",
+            onnx_decoder,
+            onnx_decoder_provider,
+        )
+        model.load_onnx_decoder(onnx_decoder, provider=onnx_decoder_provider)
     logger.info("Model loaded. Sampling rate=%s", model.sampling_rate)
 
     app = FastAPI(
@@ -210,6 +230,10 @@ def create_app(
     app.state.generate_lock = Lock()
     app.state.onnx_backbone = onnx_backbone
     app.state.onnx_provider = onnx_provider if onnx_backbone else None
+    app.state.onnx_decoder = onnx_decoder
+    app.state.onnx_decoder_provider = (
+        onnx_decoder_provider if onnx_decoder else None
+    )
     app.state.save_dir = Path(save_dir).expanduser() if save_dir else None
 
     @app.get("/health")
@@ -222,9 +246,16 @@ def create_app(
             "asr_loaded": app.state.model._asr_pipe is not None,
             "onnx_backbone": app.state.onnx_backbone,
             "onnx_provider": app.state.onnx_provider,
+            "onnx_decoder": app.state.onnx_decoder,
+            "onnx_decoder_provider": app.state.onnx_decoder_provider,
             "onnx_runtime_providers": (
                 app.state.model._onnx_backbone.providers
                 if app.state.model._onnx_backbone is not None
+                else None
+            ),
+            "onnx_decoder_runtime_providers": (
+                app.state.model._onnx_decoder.providers
+                if app.state.model._onnx_decoder is not None
                 else None
             ),
             "save_dir": str(app.state.save_dir) if app.state.save_dir else None,
@@ -396,6 +427,8 @@ def main(argv=None) -> int:
         load_asr=not args.no_asr,
         onnx_backbone=args.onnx_backbone,
         onnx_provider=args.onnx_provider,
+        onnx_decoder=args.onnx_decoder,
+        onnx_decoder_provider=args.onnx_decoder_provider,
         save_dir=args.save_dir,
     )
 

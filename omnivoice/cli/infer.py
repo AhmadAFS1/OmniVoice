@@ -128,6 +128,19 @@ def get_parser() -> argparse.ArgumentParser:
         default="auto",
         help="Provider preference when --onnx_backbone is set.",
     )
+    parser.add_argument(
+        "--onnx_decoder",
+        type=str,
+        default=None,
+        help="Optional ONNX decoder path for decoder-side ORT acceleration.",
+    )
+    parser.add_argument(
+        "--onnx_decoder_provider",
+        type=str,
+        choices=["auto", "cpu", "coreml"],
+        default="auto",
+        help="Provider preference when --onnx_decoder is set.",
+    )
     return parser
 
 
@@ -149,6 +162,13 @@ def main():
             args.onnx_provider,
         )
         model.load_onnx_backbone(args.onnx_backbone, provider=args.onnx_provider)
+    if args.onnx_decoder:
+        logging.info(
+            "Loading ONNX decoder from %s with provider=%s ...",
+            args.onnx_decoder,
+            args.onnx_decoder_provider,
+        )
+        model.load_onnx_decoder(args.onnx_decoder, provider=args.onnx_decoder_provider)
 
     logging.info(f"Generating audio for: {args.text[:80]}...")
     audios = model.generate(

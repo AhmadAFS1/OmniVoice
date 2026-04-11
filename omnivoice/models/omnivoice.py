@@ -226,7 +226,9 @@ class OmniVoice(PreTrainedModel):
         self.sampling_rate = None
         self._asr_pipe = None
         self._onnx_backbone = None
+        self._onnx_decoder = None
         self._onnx_fallback_messages = set()
+        self._onnx_decoder_fallback_messages = set()
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
@@ -312,11 +314,40 @@ class OmniVoice(PreTrainedModel):
         self._onnx_backbone = None
         self._onnx_fallback_messages.clear()
 
+    def load_onnx_decoder(
+        self,
+        onnx_path: str,
+        provider: str = "auto",
+    ) -> None:
+        """Load an ONNX Runtime audio decoder session."""
+        from omnivoice.utils.onnx_runtime import OnnxAudioDecoderSession
+
+        self._onnx_decoder = OnnxAudioDecoderSession.create(onnx_path, provider=provider)
+        self._onnx_decoder_fallback_messages.clear()
+        logger.info(
+            "Loaded ONNX decoder from %s with providers=%s (fixed_batch=%s, fixed_num_codebooks=%s, fixed_seq_len=%s)",
+            onnx_path,
+            self._onnx_decoder.providers,
+            self._onnx_decoder.fixed_batch_size,
+            self._onnx_decoder.fixed_num_codebooks,
+            self._onnx_decoder.fixed_seq_len,
+        )
+
+    def unload_onnx_decoder(self) -> None:
+        self._onnx_decoder = None
+        self._onnx_decoder_fallback_messages.clear()
+
     def _log_onnx_fallback_once(self, reason: str) -> None:
         if reason in self._onnx_fallback_messages:
             return
         self._onnx_fallback_messages.add(reason)
         logger.warning("Falling back to PyTorch backbone: %s", reason)
+
+    def _log_onnx_decoder_fallback_once(self, reason: str) -> None:
+        if reason in self._onnx_decoder_fallback_messages:
+            return
+        self._onnx_decoder_fallback_messages.add(reason)
+        logger.warning("Falling back to PyTorch decoder: %s", reason)
 
     def _should_use_onnx_backbone(
         self,
@@ -328,6 +359,20 @@ class OmniVoice(PreTrainedModel):
         if not self._onnx_backbone.supports(batch_size=batch_size, seq_len=seq_len):
             self._log_onnx_fallback_once(
                 "export shape mismatch; fixed-shape exports require an exact batch/sequence match"
+            )
+            return False
+        return True
+
+    def _should_use_onnx_decoder(self, seq_len: int) -> bool:
+        if self._onnx_decoder is None:
+            return False
+        if not self._onnx_decoder.supports(
+            batch_size=1,
+            num_codebooks=self.config.num_audio_codebook,
+            seq_len=seq_len,
+        ):
+            self._log_onnx_decoder_fallback_once(
+                "export shape mismatch; fixed-shape exports require an exact codebook/sequence match"
             )
             return False
         return True
@@ -746,20 +791,21 @@ class OmniVoice(PreTrainedModel):
             Decoded and post-processed audio tensor of shape (1, T).
         """
         tokenizer_device = self.audio_tokenizer.device
-        if isinstance(tokens, list):
-            chunk_audios = [
-                self.audio_tokenizer.decode(t.to(tokenizer_device).unsqueeze(0))
-                .audio_values[0]
-                .cpu()
-                for t in tokens
-            ]
-            audio_waveform = cross_fade_chunks(chunk_audios, self.sampling_rate)
-        else:
-            audio_waveform = (
-                self.audio_tokenizer.decode(tokens.to(tokenizer_device).unsqueeze(0))
+
+        def _decode_tokens(token_tensor: torch.Tensor) -> torch.Tensor:
+            if self._should_use_onnx_decoder(seq_len=int(token_tensor.size(-1))):
+                return self._onnx_decoder.run(token_tensor.unsqueeze(0).cpu())[0].cpu()
+            return (
+                self.audio_tokenizer.decode(token_tensor.to(tokenizer_device).unsqueeze(0))
                 .audio_values[0]
                 .cpu()
             )
+
+        if isinstance(tokens, list):
+            chunk_audios = [_decode_tokens(t) for t in tokens]
+            audio_waveform = cross_fade_chunks(chunk_audios, self.sampling_rate)
+        else:
+            audio_waveform = _decode_tokens(tokens)
 
         return self._post_process_audio(
             audio_waveform,

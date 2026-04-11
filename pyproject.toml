@@ -65,6 +65,7 @@ omnivoice-infer-batch = "omnivoice.cli.infer_batch:main"
 omnivoice-demo = "omnivoice.cli.demo:main"
 omnivoice-api = "omnivoice.cli.api_server:main"
 omnivoice-export-onnx-backbone = "omnivoice.scripts.export_onnx_backbone:main"
+omnivoice-export-onnx-decoder = "omnivoice.scripts.export_onnx_decoder:main"
 
 [project.urls]
 Homepage = "https://github.com/k2-fsa/OmniVoice"
