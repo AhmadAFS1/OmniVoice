@@ -907,3 +907,114 @@ So the current state is:
 4. phase 1 is complete enough to move forward with the dynamic export as the only acceptable ONNX backbone artifact
 5. phase 1 still does not improve throughput on this machine
 6. the next bottleneck to solve is CoreML EP compatibility or a different Apple-accelerated deployment path
+
+## Phase 2 CoreMLExecutionProvider
+
+Status as of 2026-04-11: CoreMLExecutionProvider is now working with the dynamic ONNX backbone on this Mac, but it is still slower than the existing PyTorch + MPS path for full generation.
+
+### What Changed
+
+The initial CoreML EP attempts failed with:
+
+```text
+EP Error SystemError : 20
+```
+
+That failure mode was tied to letting CoreML EP accept dynamic input shapes directly.
+
+The working configuration is:
+
+- dynamic ONNX backbone export
+- CoreMLExecutionProvider enabled
+- `RequireStaticInputShapes=1`
+- `EnableOnSubgraphs=0`
+- `ModelFormat=NeuralNetwork`
+- `MLComputeUnits=ALL`
+- `ModelCacheDirectory=<persistent cache dir>`
+- ORT graph optimizations disabled for fidelity
+
+This allows the dynamic ONNX model to keep native prompt length while still letting CoreML EP claim supported partitions.
+
+### Runtime Integration
+
+The ONNX runtime helper now:
+
+- uses a persistent CoreML cache directory next to the ONNX model
+- defaults CoreML EP to `NeuralNetwork` format on macOS
+- forces static input shapes at the provider level
+- exposes actual loaded ORT providers through the API health endpoint
+
+Example health response now includes:
+
+```json
+{
+  "onnx_provider": "coreml",
+  "onnx_runtime_providers": ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+}
+```
+
+This confirms the session is not falling back to CPU-only at load time.
+
+### CoreML Parity Check
+
+The dynamic ONNX parity script with `--provider coreml` still shows clean backbone parity:
+
+| Comparison | Max abs diff | Mean abs diff | Argmax mismatch rate |
+|---|---:|---:|---:|
+| native-length PyTorch vs ONNX Runtime CoreML-backed session | 0.000458 | 0.000034 | 0.0 |
+
+So CoreML EP did not reintroduce the earlier quality bug.
+
+### CoreML Runtime Benchmark
+
+CoreML-backed ONNX server command:
+
+```bash
+/Users/ahmadsmacair/OmniVoice/.venv/bin/omnivoice-api \
+  --model k2-fsa/OmniVoice \
+  --device mps \
+  --no-asr \
+  --onnx-backbone /Users/ahmadsmacair/OmniVoice/artifacts/onnx_dynamic/omnivoice_backbone_dynamic.onnx \
+  --onnx-provider coreml \
+  --save-dir /Users/ahmadsmacair/OmniVoice/local/api_outputs/onnx_coreml \
+  --ip 127.0.0.1 \
+  --port 8006
+```
+
+Measured localhost `/generate` timings at `num_step=16` for the same short design prompt:
+
+| Backend | Run | Wall time |
+|---|---:|---:|
+| ONNX Runtime + CoreML EP | 1 | 30.453s |
+| ONNX Runtime + CoreML EP | 2 | 25.521s |
+| PyTorch + MPS | 1 | 12.632s |
+| PyTorch + MPS | 2 | 5.095s |
+
+Interpretation:
+
+- CoreML EP is active and quality is preserved.
+- On this 2022 MacBook Air, the current hybrid ONNX + CoreML path is still slower than PyTorch + MPS.
+- The gap is smaller than the old broken fixed-shape ONNX path in terms of correctness, but not yet in terms of speed.
+
+### Phase 2 Verdict
+
+What is now true:
+
+- CoreMLExecutionProvider is no longer broken for the dynamic backbone.
+- The dynamic ONNX backbone can run through CoreML EP on macOS.
+- Audio quality remains aligned with the PyTorch baseline.
+
+What is still not true:
+
+- CoreML-backed ONNX is not yet faster than PyTorch + MPS on this machine.
+- The current stack is still hybrid; the decoder remains in PyTorch.
+- This is still not a true iPhone deployment path.
+
+So the current Apple-side ranking on this Mac is:
+
+1. PyTorch + MPS
+2. ONNX Runtime + CoreML EP
+3. PyTorch + CPU
+4. ONNX Runtime + CPU
+
+The next likely optimization path is no longer “fix CoreML EP”. That part is now working. The next question is whether direct Core ML conversion of the backbone and decoder can beat the hybrid ORT path, or whether the PyTorch/MPS path simply remains the best Mac-local option while the iPhone path is built separately.

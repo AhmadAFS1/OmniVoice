@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
@@ -46,6 +48,25 @@ def _build_provider_list(ort_module, preference: ProviderPreference) -> list[Any
     return providers
 
 
+def _build_coreml_provider_options(onnx_path: str) -> dict[str, str]:
+    onnx_file = Path(onnx_path).resolve()
+    cache_dir = onnx_file.parent / f"{onnx_file.stem}.coreml_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    options = {
+        "ModelFormat": "NeuralNetwork",
+        "MLComputeUnits": "ALL",
+        "RequireStaticInputShapes": "1",
+        "EnableOnSubgraphs": "0",
+        "ModelCacheDirectory": str(cache_dir),
+    }
+
+    if os.environ.get("OMNIVOICE_COREML_PROFILE_PLAN") == "1":
+        options["ProfileComputePlan"] = "1"
+
+    return options
+
+
 @dataclass
 class OnnxBackboneSession:
     path: str
@@ -73,6 +94,13 @@ class OnnxBackboneSession:
         session_options = ort.SessionOptions()
         session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
         providers = _build_provider_list(ort, provider)
+        if providers and isinstance(providers[0], tuple):
+            name, options = providers[0]
+            if name == "CoreMLExecutionProvider":
+                providers[0] = (
+                    name,
+                    {**options, **_build_coreml_provider_options(onnx_path)},
+                )
         session = ort.InferenceSession(
             onnx_path,
             sess_options=session_options,

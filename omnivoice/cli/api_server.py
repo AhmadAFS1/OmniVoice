@@ -222,6 +222,11 @@ def create_app(
             "asr_loaded": app.state.model._asr_pipe is not None,
             "onnx_backbone": app.state.onnx_backbone,
             "onnx_provider": app.state.onnx_provider,
+            "onnx_runtime_providers": (
+                app.state.model._onnx_backbone.providers
+                if app.state.model._onnx_backbone is not None
+                else None
+            ),
             "save_dir": str(app.state.save_dir) if app.state.save_dir else None,
         }
 
