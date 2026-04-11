@@ -206,8 +206,8 @@ The most realistic Core ML strategy is not "convert the whole repo." It is to sp
 
 - Keep the text/token generation orchestration in native code or a React Native native module.
 - Convert the heavy neural pieces first, likely the main model and audio decoder/tokenizer path.
-- Avoid Whisper ASR and avoid voice cloning initially.
-- Start with auto/design voice only.
+- Keep voice cloning in scope, but do not require the voice-clone prompt encoder to be exported in the first milestone.
+- Avoid Whisper ASR initially by requiring `ref_text` when testing clone mode.
 - Use short fixed-shape test cases first, then expand once latency and memory are understood.
 
 ### ONNX vs Core ML
@@ -225,13 +225,169 @@ Practical recommendation:
 
 Use ONNX first as the fastest experiment, especially because a third-party ONNX export candidate already exists. If it runs but is too slow, then try converting the heavy pieces to direct Core ML. For iPhone performance, the target should be direct Core ML or ONNX Runtime using the CoreML Execution Provider, not ONNX Runtime CPU-only.
 
+## Localhost ONNX Runtime Phase Plan
+
+This is the best localhost-first path for testing whether ONNX Runtime can improve throughput before touching React Native.
+
+### Current inference path
+
+The current FastAPI server simply loads the model once and calls `model.generate(...)` for each request.
+
+Inside `generate(...)`, the current flow is:
+
+1. text preprocessing and tokenization
+2. optional voice prompt preparation
+3. iterative diffusion-style decoding
+4. audio token decoding
+5. waveform post-processing
+
+The most expensive part is the iterative decoding loop in `_generate_iterative(...)`. It runs the backbone forward pass once per diffusion step, and with classifier-free guidance it evaluates both conditional and unconditional paths.
+
+### What should move to ONNX first
+
+The practical export order is:
+
+1. OmniVoice backbone
+2. audio decoder
+3. voice-clone prompt encoder
+4. ASR only if absolutely needed
+
+Why this order:
+
+- The backbone runs every diffusion step, so it dominates latency.
+- The decoder runs once at the end.
+- Voice-clone prompt creation runs once per request.
+- Whisper ASR is not desirable in the first ORT milestone.
+
+### Voice cloning requirement
+
+Voice cloning can stay working in the first ONNX Runtime milestone.
+
+The way to do that is:
+
+- keep `create_voice_clone_prompt(...)` in PyTorch first
+- export only the heavy backbone first
+- continue passing `ref_audio` and `ref_text`
+- strongly prefer requiring `ref_text` so Whisper does not load
+
+That preserves clone mode while still attacking the main throughput bottleneck.
+
+### What ONNX Runtime actually replaces
+
+ONNX Runtime should not replace the whole `model.generate(...)` method at first.
+
+Instead, keep the current Python orchestration and replace the expensive backbone forward call inside the diffusion loop.
+
+In other words:
+
+- keep current preprocessing in Python
+- keep current scheduling and diffusion loop in Python
+- keep current scoring logic in Python
+- keep current post-processing in Python
+- replace the repeated backbone forward pass with an ONNX Runtime session
+
+This is the fastest way to answer whether ONNX Runtime helps on localhost.
+
+### Export target for phase 1
+
+The first export target should be a backbone wrapper with inputs and outputs that mirror the current diffusion loop:
+
+- `input_ids: [B, C, S]`
+- `audio_mask: [B, S]`
+- `attention_mask: [B, 1, S, S]`
+- output `logits: [B, C, S, V]`
+
+Keeping `attention_mask` explicit avoids baking in too many assumptions too early and keeps closer parity with the current PyTorch behavior.
+
+### Existing external evidence
+
+There is already a useful public reference project that split OmniVoice into separate exported backbone and decoder modules:
+
+- `acul3/OmniVoice-LiteRT`
+
+Its approach matches the recommended direction here:
+
+- export backbone separately
+- export decoder separately
+- keep the diffusion loop outside the exported model
+
+This is a strong signal that the model can be decomposed in a useful way for ONNX Runtime or other edge runtimes.
+
+### Best ONNX Runtime provider for localhost
+
+For a local MacBook Air test, the most relevant ONNX Runtime provider is:
+
+- `CoreMLExecutionProvider`
+
+with CPU fallback.
+
+That does not mean React Native yet. It just means the localhost Python benchmark should try ONNX Runtime on macOS with Core ML acceleration where possible.
+
+Dynamic shapes may work, but the CoreML Execution Provider documentation notes that dynamic shapes can hurt performance. If the first dynamic-shape export works but is not fast enough, the next optimization should be bucketed static-shape exports such as fixed sequence lengths.
+
+### Likely implementation phases
+
+Phase 1:
+
+- Export backbone to ONNX.
+- Add a localhost Python ONNX Runtime backend.
+- Keep decoder in PyTorch.
+- Keep voice cloning prompt creation in PyTorch.
+- Benchmark localhost throughput versus current MPS PyTorch.
+
+Phase 2:
+
+- Export decoder to ONNX if backbone-only ORT shows a worthwhile speedup.
+- Compare end-to-end throughput again.
+
+Phase 3:
+
+- Optimize for CoreML Execution Provider or static-shape buckets.
+- Then consider React Native integration.
+
+Phase 4:
+
+- Only after the localhost path is proven, revisit mobile integration.
+- If needed, export or replace the voice-clone prompt encoder too.
+
+### Expected benefit and risk
+
+Best case:
+
+- backbone ONNX Runtime is faster than PyTorch MPS
+- localhost throughput improves materially
+- the same exported model architecture becomes a better stepping stone toward React Native
+
+Main risks:
+
+- ONNX Runtime may not beat PyTorch MPS on this Mac
+- dynamic shapes may limit Core ML acceleration
+- large model export may require external data files
+- decoder and clone prompt paths may still remain PyTorch bottlenecks after backbone export
+
+### Recommended localhost order
+
+1. Backbone-only ONNX export
+2. Local Python ONNX Runtime backend
+3. Benchmark against current PyTorch API
+4. Add decoder export only if backbone export is promising
+5. Keep voice cloning supported by leaving prompt creation in PyTorch until later
+
 ## Recommended Prototype Plan
 
-1. Do not start with voice cloning.
+1. Start with a localhost Python ONNX Runtime benchmark before React Native.
 
-   Test auto/design voice first with the smallest useful model set. Avoid the voice-cloning encoder and avoid Whisper. Voice cloning can be evaluated later after the basic latency and memory profile is known.
+   The goal is to answer one question first: does ONNX Runtime improve throughput on the current MacBook Air versus PyTorch MPS?
 
-2. Build a tiny React Native benchmark app with `onnxruntime-react-native`.
+2. Keep voice cloning working during the ONNX Runtime rollout.
+
+   For the first ONNX milestone, voice cloning should continue to work by keeping prompt creation in PyTorch. Require `ref_text` during testing so Whisper does not load. Exporting the prompt encoder can be deferred until later.
+
+3. Export the backbone before anything else.
+
+   This is the main throughput target because it runs every diffusion step.
+
+4. Build a tiny React Native benchmark app with `onnxruntime-react-native` only after localhost ORT proves useful.
 
    The benchmark should measure:
 
@@ -243,7 +399,7 @@ Use ONNX first as the fastest experiment, especially because a third-party ONNX 
    - battery and thermal behavior after repeated generations
    - audio quality at 8, 16, and 32 steps if supported
 
-3. Use short utterances first.
+5. Use short and medium utterances first.
 
    Suggested test strings:
 
@@ -251,13 +407,13 @@ Use ONNX first as the fastest experiment, especially because a third-party ONNX 
    - 5 seconds of speech
    - 10 seconds of speech
 
-   Long-form generation is less important than proving the base path can run within mobile constraints.
+   Also include at least one clone-mode test with a supplied `ref_text`, because voice cloning is a hard requirement for the product.
 
-4. Define a minimum supported device.
+6. Define a minimum supported device.
 
    Do not judge by a flagship device only. Pick the actual lowest-end iPhone and Android device you are willing to support. Test on real hardware, not only a simulator.
 
-5. Use a pass/fail threshold.
+7. Use a pass/fail threshold.
 
    A practical first target:
 
@@ -384,4 +540,7 @@ External:
 - `k2-fsa/OmniVoice` Hugging Face model: https://huggingface.co/k2-fsa/OmniVoice
 - OmniVoice paper: https://arxiv.org/abs/2604.00688
 - ONNX Runtime React Native docs: https://onnxruntime.ai/docs/get-started/with-javascript/react-native.html
+- ONNX Runtime CoreML Execution Provider docs: https://onnxruntime.ai/docs/execution-providers/CoreML-ExecutionProvider.html
+- PyTorch ONNX export docs: https://pytorch.org/docs/stable/onnx.html
+- `acul3/OmniVoice-LiteRT`: https://huggingface.co/acul3/OmniVoice-LiteRT
 - Third-party ONNX export candidate: https://huggingface.co/Gigsu/vocoloco-onnx
