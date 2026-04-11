@@ -373,6 +373,71 @@ Main risks:
 4. Add decoder export only if backbone export is promising
 5. Keep voice cloning supported by leaving prompt creation in PyTorch until later
 
+### Phase 1 implementation status
+
+Phase 1 has been wired into this repo as an optional backend.
+
+What is implemented:
+
+- ONNX backbone export script: `omnivoice-export-onnx-backbone`
+- optional ONNX Runtime backbone loading in `OmniVoice`
+- API flag: `--onnx-backbone`
+- API flag: `--onnx-provider auto|cpu|coreml`
+- single-item CLI flag: `--onnx_backbone`
+- single-item CLI flag: `--onnx_provider auto|cpu|coreml`
+
+What still stays in PyTorch during phase 1:
+
+- voice-clone prompt creation
+- audio decoder
+- post-processing
+- all Python orchestration around the diffusion loop
+
+What this means in practice:
+
+- the heavy repeated backbone forward pass can run through ONNX Runtime
+- voice cloning can still work if `ref_text` is provided
+- Whisper ASR should still be avoided during testing
+- if the request shape does not match the exported ONNX backbone shape, the code falls back to the normal PyTorch backbone
+
+Example export command:
+
+```bash
+uv sync --extra onnx
+uv run omnivoice-export-onnx-backbone \
+  --model k2-fsa/OmniVoice \
+  --output artifacts/onnx/omnivoice_backbone.onnx \
+  --seq-len 1024 \
+  --batch-size 2
+```
+
+Example localhost API command:
+
+```bash
+uv run omnivoice-api \
+  --model k2-fsa/OmniVoice \
+  --device mps \
+  --no-asr \
+  --onnx-backbone artifacts/onnx/omnivoice_backbone.onnx \
+  --onnx-provider coreml \
+  --ip 127.0.0.1 \
+  --port 8002
+```
+
+Example single-item CLI command:
+
+```bash
+uv run omnivoice-infer \
+  --model k2-fsa/OmniVoice \
+  --device mps \
+  --onnx_backbone artifacts/onnx/omnivoice_backbone.onnx \
+  --onnx_provider coreml \
+  --text "This is a short test of local ONNX Runtime inference." \
+  --instruct "female, american accent" \
+  --num_step 16 \
+  --output ort_test.wav
+```
+
 ## Recommended Prototype Plan
 
 1. Start with a localhost Python ONNX Runtime benchmark before React Native.
@@ -544,3 +609,301 @@ External:
 - PyTorch ONNX export docs: https://pytorch.org/docs/stable/onnx.html
 - `acul3/OmniVoice-LiteRT`: https://huggingface.co/acul3/OmniVoice-LiteRT
 - Third-party ONNX export candidate: https://huggingface.co/Gigsu/vocoloco-onnx
+
+## Phase 1 ONNX Runtime Validation
+
+Status as of 2026-04-11: the phase-1 ONNX Runtime migration is functionally integrated, and the dynamic-sequence backbone export fixes the major quality failure caused by fixed-shape padding. It is still not a throughput win on this MacBook Air.
+
+### What Was Implemented
+
+Phase 1 keeps the existing OmniVoice generation orchestration and swaps only the repeated backbone forward pass to ONNX Runtime.
+
+Implemented pieces:
+
+- optional ONNX backbone loader inside `OmniVoice`
+- phase-1 ONNX Runtime session helper
+- backbone export wrapper and export CLI
+- CLI flag support in `omnivoice-infer`
+- API flag support in `omnivoice-api`
+- voice cloning preserved by keeping prompt creation in PyTorch
+
+This is a hybrid migration, not a full PyTorch removal.
+
+### Export Results
+
+Machine constraints:
+
+- 2022 MacBook Air
+- 8 GB RAM (`hw.memsize = 8589934592`)
+
+Successful fixed-shape exports:
+
+| Export | Result | Wall time | Max RSS |
+|---|---|---:|---:|
+| `batch=2, seq=64` | success | 52.41s | about 2.18 GB |
+| `batch=2, seq=640` | success | 66.69s | about 2.49 GB |
+
+Artifacts:
+
+- `artifacts/onnx/omnivoice_backbone_bs2_seq640.onnx`
+- external weight files emitted by PyTorch ONNX export in the same directory
+
+The earlier `seq=1024` attempt did not complete, so it was not used for validation.
+
+Successful dynamic export:
+
+| Export | Result | Wall time | Max RSS |
+|---|---|---:|---:|
+| `dynamic seq, example batch=2, example seq=128` | success | 63.43s | about 1.86 GB |
+
+Dynamic artifact used for parity:
+
+- `artifacts/onnx_dynamic/omnivoice_backbone_dynamic.onnx`
+- external weight files emitted alongside it in `artifacts/onnx_dynamic/`
+
+### Measured Sequence Lengths
+
+To avoid exporting a larger graph than necessary, I measured the actual prepared input lengths for the current test prompts.
+
+Design voice:
+
+| Case | Target audio tokens | Input sequence length |
+|---|---:|---:|
+| short sentence | 66 | 88 |
+| longer sentence | 286 | 331 |
+
+Voice cloning using `local_test_10sec.wav` plus provided `ref_text`:
+
+| Case | Reference audio tokens | Target audio tokens | Input sequence length |
+|---|---:|---:|---:|
+| short target text | 259 | 59 | 372 |
+| longer target text | 259 | 259 | 595 |
+
+That is why the validated export target was `seq=640`.
+
+### CoreML Execution Provider Result
+
+ONNX Runtime is installed with CoreML support on this Mac:
+
+```python
+['CoreMLExecutionProvider', 'AzureExecutionProvider', 'CPUExecutionProvider']
+```
+
+However, CoreML EP did not actually work for this exported OmniVoice backbone.
+
+Tested combinations all failed with the same fallback behavior:
+
+- `ModelFormat=MLProgram`, `MLComputeUnits=ALL`
+- `ModelFormat=NeuralNetwork`, `MLComputeUnits=ALL`
+- `ModelFormat=NeuralNetwork`, `MLComputeUnits=CPUAndGPU`
+- `ModelFormat=MLProgram`, `MLComputeUnits=CPUAndGPU`
+- `RequireStaticInputShapes=1`
+- `ModelCacheDirectory` enabled
+
+Observed runtime behavior:
+
+```text
+EP Error SystemError : 20
+Falling back to ['CPUExecutionProvider'] and retrying.
+```
+
+So on this machine, the ONNX path is currently CPU-only in practice.
+
+### Fixed-Shape Root Cause
+
+The original fixed-shape ONNX export was not quality-safe for short prompts.
+
+Direct parity measurements showed:
+
+| Comparison | Max abs diff | Mean abs diff | Argmax mismatch rate |
+|---|---:|---:|---:|
+| native-length PyTorch vs padded PyTorch | 41.63 | 1.95 | 0.8366 |
+| padded PyTorch vs ONNX Runtime | 0.000412 | 0.000038 | 0.0 |
+
+Interpretation:
+
+- ONNX Runtime was faithfully reproducing the padded graph.
+- The real quality bug came from padding a short request up to the fixed export length.
+- That padding caused the pitch/spacing corruption heard in earlier ONNX audio tests.
+
+Because of that, the runtime no longer pads requests to fit a fixed-shape ONNX export. Fixed-shape exports are now treated as exact-shape only.
+
+### Dynamic-Sequence Parity Validation
+
+The dynamic-sequence export removes the padding path and restores backbone parity at native prompt length.
+
+Measured with `omnivoice/scripts/debug_onnx_parity.py` against `artifacts/onnx_dynamic/omnivoice_backbone_dynamic.onnx`:
+
+| Comparison | Max abs diff | Mean abs diff | Argmax mismatch rate |
+|---|---:|---:|---:|
+| native-length PyTorch vs dynamic-shape PyTorch baseline | 0.0 | 0.0 | 0.0 |
+| dynamic-shape PyTorch baseline vs ONNX Runtime | 0.000519 | 0.000038 | 0.0 |
+| native-length PyTorch vs ONNX Runtime | 0.000519 | 0.000038 | 0.0 |
+
+Interpretation:
+
+- The dynamic ONNX backbone matches native-length PyTorch closely enough for backbone parity.
+- The large quality regression from the earlier ONNX test was caused by fixed-shape padding, not by ORT fundamentally changing the backbone.
+
+### End-to-End Runtime Validation
+
+The ONNX path now works end to end for both design mode and clone mode.
+
+CLI validation:
+
+| Mode | Command shape | Result | Output |
+|---|---|---|---|
+| design | ONNX backbone, provider=`cpu`, `num_step=2` | success | `ort_short_num2.wav` |
+| clone | ONNX backbone, provider=`cpu`, `num_step=2`, `ref_audio` + `ref_text` | success | `ort_clone_num2.wav` |
+
+Measured outputs:
+
+| File | Duration |
+|---|---:|
+| `ort_short_num2.wav` | 2.84s |
+| `ort_clone_num2.wav` | 2.50s |
+
+So voice cloning remains functional in the phase-1 hybrid path as long as `ref_text` is provided and Whisper ASR stays disabled.
+
+Dynamic export status:
+
+- the dynamic backbone loads through the same ONNX Runtime path
+- fixed-shape padding is no longer used
+- the dynamic export is now the recommended phase-1 artifact
+
+Deterministic end-to-end generation check (`num_step=16`, `position_temperature=0`, `class_temperature=0`) on CPU:
+
+| Check | Result |
+|---|---|
+| generated token mismatch rate | about `0.00189` |
+| number of mismatched tokens | `1` out of `528` |
+
+The one remaining mismatch appeared at:
+
+- codebook layer `7`
+- position `51`
+- PyTorch token `625`
+- ONNX token `467`
+
+This means the dynamic export is not bit-exact through the full iterative decode, but it is dramatically closer than the broken fixed-shape path and no longer exhibits the gross spacing/pitch corruption mechanism caused by padding.
+
+Deterministic comparison WAVs saved locally:
+
+- `local/phase1_pt_det.wav`
+- `local/phase1_ort_det.wav`
+
+### Localhost API Validation
+
+Validated ONNX-backed API server:
+
+```bash
+uv run omnivoice-api \
+  --model k2-fsa/OmniVoice \
+  --device mps \
+  --no-asr \
+  --onnx-backbone artifacts/onnx/omnivoice_backbone_bs2_seq640.onnx \
+  --onnx-provider cpu \
+  --ip 127.0.0.1 \
+  --port 8002
+```
+
+Observed health response:
+
+```json
+{
+  "status": "ok",
+  "model": "k2-fsa/OmniVoice",
+  "device": "mps",
+  "sampling_rate": 24000,
+  "asr_loaded": false,
+  "onnx_backbone": "artifacts/onnx/omnivoice_backbone_bs2_seq640.onnx",
+  "onnx_provider": "cpu"
+}
+```
+
+### Throughput Comparison on This Mac
+
+Apples-to-apples API test:
+
+- same short sentence
+- design mode
+- same `num_step=2`
+- same localhost request path
+- same output duration: `2.67s`
+
+| Backend | Request wall time | Output duration | Approx RTF |
+|---|---:|---:|---:|
+| PyTorch + MPS API | 10.491s | 2.67s | about 3.93 |
+| ONNX Runtime + CPU API | 21.305s | 2.67s | about 7.98 |
+
+Result:
+
+- ONNX Runtime on this Mac is about 2.0x slower than the current PyTorch/MPS path for this validated short request.
+- The reason is not the hybrid architecture by itself. The main issue is that CoreML EP is failing and ORT is falling back to CPU.
+
+### Additional Warm Benchmark Update
+
+User-ran warm-server comparison on 2026-04-10 with the same short design prompt:
+
+```text
+This is a short test of local text to speech.
+```
+
+Server startup observations from logs:
+
+| Server | Startup window | Approx startup time |
+|---|---|---:|
+| ONNX Runtime + CPU API (`8002`) | `20:57:20.097` -> `20:57:30.160` | about 10.06s |
+| PyTorch + MPS API (`8003`) | `20:57:52.198` -> `20:57:59.424` | about 7.23s |
+
+Warm request timings:
+
+| Backend | Run | Request wall time | Output duration | Approx RTF |
+|---|---:|---:|---:|---:|
+| ONNX Runtime + CPU API | 1 | 18.935730s | 2.84s | about 6.67 |
+| ONNX Runtime + CPU API | 2 | 19.164227s | 2.84s | about 6.75 |
+| PyTorch + MPS API | 1 | 4.007727s | 2.48s | about 1.62 |
+| PyTorch + MPS API | 2 | 1.368771s | 2.48s | about 0.55 |
+
+Additional CPU-only baseline:
+
+| Backend | Request wall time |
+|---|---:|
+| PyTorch + CPU API (`8004`) | 15.269604s |
+
+Interpretation:
+
+- The newer warm runs show a larger performance gap than the earlier one-off measurement.
+- PyTorch + MPS is the clear winner on this MacBook Air.
+- PyTorch + CPU is still faster than the current ONNX Runtime + CPU path.
+- Current backend ranking on this machine is:
+  1. PyTorch + MPS
+  2. PyTorch + CPU
+  3. ONNX Runtime + CPU
+
+This means the current ONNX phase-1 path is not only losing to MPS acceleration. It is also losing to plain PyTorch on CPU.
+
+### Current Verdict
+
+The phase-1 ONNX migration is complete enough to validate functionally:
+
+- export works
+- ONNX Runtime loading works
+- CLI works
+- API works
+- voice cloning still works
+
+But it is not performance-ready on this MacBook Air:
+
+- CoreML EP currently fails with `SystemError : 20`
+- the ORT path falls back to CPU
+- CPU ORT is slower than both PyTorch/MPS and PyTorch/CPU
+
+So the current state is:
+
+1. the bad fixed-shape padded ONNX path is no longer acceptable and has been effectively superseded
+2. the dynamic-sequence backbone export works and restores backbone parity
+3. end-to-end dynamic decode is very close, but not fully bit-exact through all generation steps
+4. phase 1 is complete enough to move forward with the dynamic export as the only acceptable ONNX backbone artifact
+5. phase 1 still does not improve throughput on this machine
+6. the next bottleneck to solve is CoreML EP compatibility or a different Apple-accelerated deployment path

@@ -18,6 +18,7 @@ build/
 /results/
 /data/
 /download
+/artifacts/
 /local/
 /run*
 example.py

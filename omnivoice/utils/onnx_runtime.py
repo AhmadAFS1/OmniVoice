@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""Helpers for running OmniVoice backbone inference with ONNX Runtime."""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Any, Literal
+
+import numpy as np
+import torch
+
+logger = logging.getLogger(__name__)
+
+ProviderPreference = Literal["auto", "cpu", "coreml"]
+
+
+def _maybe_int_dim(value: Any) -> int | None:
+    return value if isinstance(value, int) and value > 0 else None
+
+
+def _build_provider_list(ort_module, preference: ProviderPreference) -> list[Any]:
+    available = set(ort_module.get_available_providers())
+    providers: list[Any] = []
+
+    if preference in ("auto", "coreml") and "CoreMLExecutionProvider" in available:
+        providers.append(
+            (
+                "CoreMLExecutionProvider",
+                {
+                    "ModelFormat": "MLProgram",
+                    "MLComputeUnits": "ALL",
+                },
+            )
+        )
+
+    if "CPUExecutionProvider" in available:
+        providers.append("CPUExecutionProvider")
+
+    if not providers:
+        raise RuntimeError(
+            "No supported ONNX Runtime providers are available. "
+            f"Available providers: {sorted(available)}"
+        )
+
+    return providers
+
+
+@dataclass
+class OnnxBackboneSession:
+    path: str
+    session: Any
+    providers: list[str]
+    fixed_batch_size: int | None
+    fixed_seq_len: int | None
+    input_names: dict[str, str]
+    output_name: str
+
+    @classmethod
+    def create(
+        cls,
+        onnx_path: str,
+        provider: ProviderPreference = "auto",
+    ) -> "OnnxBackboneSession":
+        try:
+            import onnxruntime as ort
+        except ImportError as exc:
+            raise RuntimeError(
+                "onnxruntime is not installed. Install it with "
+                "`uv sync --extra onnx` before enabling the ONNX backend."
+            ) from exc
+
+        session_options = ort.SessionOptions()
+        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        providers = _build_provider_list(ort, provider)
+        session = ort.InferenceSession(
+            onnx_path,
+            sess_options=session_options,
+            providers=providers,
+        )
+
+        inputs = {i.name: i.shape for i in session.get_inputs()}
+        output_name = session.get_outputs()[0].name
+
+        batch_shape = inputs["input_ids"][0]
+        seq_shape = inputs["input_ids"][2]
+
+        return cls(
+            path=onnx_path,
+            session=session,
+            providers=session.get_providers(),
+            fixed_batch_size=_maybe_int_dim(batch_shape),
+            fixed_seq_len=_maybe_int_dim(seq_shape),
+            input_names={
+                "input_ids": "input_ids",
+                "audio_mask": "audio_mask",
+                "attention_mask": "attention_mask",
+            },
+            output_name=output_name,
+        )
+
+    def supports(self, batch_size: int, seq_len: int) -> bool:
+        if self.fixed_batch_size is not None and batch_size != self.fixed_batch_size:
+            return False
+        if self.fixed_seq_len is not None and seq_len != self.fixed_seq_len:
+            return False
+        return True
+
+    def run(
+        self,
+        input_ids: torch.Tensor,
+        audio_mask: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if input_ids.device.type != "cpu":
+            raise RuntimeError("ONNX Runtime backbone expects CPU tensors as inputs.")
+
+        batch_size = int(input_ids.shape[0])
+        seq_len = int(input_ids.shape[-1])
+        if not self.supports(batch_size=batch_size, seq_len=seq_len):
+            raise RuntimeError(
+                f"ONNX backbone export at {self.path} does not support batch_size={batch_size}, "
+                f"seq_len={seq_len}. Fixed batch={self.fixed_batch_size}, "
+                f"fixed seq_len={self.fixed_seq_len}."
+            )
+
+        ort_inputs = {
+            self.input_names["input_ids"]: np.ascontiguousarray(
+                input_ids.numpy().astype(np.int64, copy=False)
+            ),
+            self.input_names["audio_mask"]: np.ascontiguousarray(
+                audio_mask.numpy().astype(np.bool_, copy=False)
+            ),
+            self.input_names["attention_mask"]: np.ascontiguousarray(
+                attention_mask.numpy().astype(np.bool_, copy=False)
+            ),
+        }
+
+        outputs = self.session.run([self.output_name], ort_inputs)[0]
+        return torch.from_numpy(outputs.astype(np.float32, copy=False))

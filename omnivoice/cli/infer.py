@@ -115,6 +115,19 @@ def get_parser() -> argparse.ArgumentParser:
         default=None,
         help="Device to use for inference. Auto-detected if not specified.",
     )
+    parser.add_argument(
+        "--onnx_backbone",
+        type=str,
+        default=None,
+        help="Optional ONNX backbone path for phase-1 ORT acceleration.",
+    )
+    parser.add_argument(
+        "--onnx_provider",
+        type=str,
+        choices=["auto", "cpu", "coreml"],
+        default="auto",
+        help="Provider preference when --onnx_backbone is set.",
+    )
     return parser
 
 
@@ -129,6 +142,13 @@ def main():
     model = OmniVoice.from_pretrained(
         args.model, device_map=device, dtype=torch.float16
     )
+    if args.onnx_backbone:
+        logging.info(
+            "Loading ONNX backbone from %s with provider=%s ...",
+            args.onnx_backbone,
+            args.onnx_provider,
+        )
+        model.load_onnx_backbone(args.onnx_backbone, provider=args.onnx_provider)
 
     logging.info(f"Generating audio for: {args.text[:80]}...")
     audios = model.generate(

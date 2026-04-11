@@ -225,6 +225,8 @@ class OmniVoice(PreTrainedModel):
         self.duration_estimator = None
         self.sampling_rate = None
         self._asr_pipe = None
+        self._onnx_backbone = None
+        self._onnx_fallback_messages = set()
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
@@ -282,6 +284,53 @@ class OmniVoice(PreTrainedModel):
             logging.disable(_prev_disable)
 
         return model
+
+    def load_onnx_backbone(
+        self,
+        onnx_path: str,
+        provider: str = "auto",
+    ) -> None:
+        """Load a phase-1 ONNX Runtime backbone session.
+
+        This accelerates the repeated backbone forward pass inside the diffusion
+        loop while keeping the existing Python generation orchestration,
+        post-processing, and voice-clone prompt path.
+        """
+        from omnivoice.utils.onnx_runtime import OnnxBackboneSession
+
+        self._onnx_backbone = OnnxBackboneSession.create(onnx_path, provider=provider)
+        self._onnx_fallback_messages.clear()
+        logger.info(
+            "Loaded ONNX backbone from %s with providers=%s (fixed_batch=%s, fixed_seq_len=%s)",
+            onnx_path,
+            self._onnx_backbone.providers,
+            self._onnx_backbone.fixed_batch_size,
+            self._onnx_backbone.fixed_seq_len,
+        )
+
+    def unload_onnx_backbone(self) -> None:
+        self._onnx_backbone = None
+        self._onnx_fallback_messages.clear()
+
+    def _log_onnx_fallback_once(self, reason: str) -> None:
+        if reason in self._onnx_fallback_messages:
+            return
+        self._onnx_fallback_messages.add(reason)
+        logger.warning("Falling back to PyTorch backbone: %s", reason)
+
+    def _should_use_onnx_backbone(
+        self,
+        batch_size: int,
+        seq_len: int,
+    ) -> bool:
+        if self._onnx_backbone is None:
+            return False
+        if not self._onnx_backbone.supports(batch_size=batch_size, seq_len=seq_len):
+            self._log_onnx_fallback_once(
+                "export shape mismatch; fixed-shape exports require an exact batch/sequence match"
+            )
+            return False
+        return True
 
     # -------------------------------------------------------------------
     # ASR support (optional, for auto-transcription)
@@ -1043,6 +1092,7 @@ class OmniVoice(PreTrainedModel):
         lang: Optional[str] = None,
         instruct: Optional[str] = None,
         denoise: bool = True,
+        device: Optional[torch.device] = None,
     ):
         """Prepare input_ids and audio masks for inference.
         Args:
@@ -1058,6 +1108,7 @@ class OmniVoice(PreTrainedModel):
 
         # Build style tokens: <|denoise|> + <|lang_start|>...<|lang_end|>
         #                      + <|instruct_start|>...<|instruct_end|>
+        target_device = device or self.device
         style_text = ""
         if denoise and ref_audio_tokens is not None:
             style_text += "<|denoise|>"
@@ -1070,9 +1121,7 @@ class OmniVoice(PreTrainedModel):
             self.text_tokenizer(style_text, return_tensors="pt")
             .input_ids.repeat(self.config.num_audio_codebook, 1)
             .unsqueeze(0)
-        ).to(
-            self.device
-        )  # [1, C, N1]
+        ).to(target_device)  # [1, C, N1]
 
         # Build text tokens
         full_text = _combine_text(ref_text=ref_text, text=text)
@@ -1081,22 +1130,20 @@ class OmniVoice(PreTrainedModel):
             _tokenize_with_nonverbal_tags(wrapped_text, self.text_tokenizer)
             .repeat(self.config.num_audio_codebook, 1)
             .unsqueeze(0)
-        ).to(
-            self.device
-        )  # [1, C, N2]
+        ).to(target_device)  # [1, C, N2]
 
         # Target: all MASK
         target_audio_tokens = torch.full(
             (1, self.config.num_audio_codebook, num_target_tokens),
             self.config.audio_mask_id,
             dtype=torch.long,
-            device=self.device,
+            device=target_device,
         )
 
         # Conditional input
         parts = [style_tokens, text_tokens]
         if ref_audio_tokens is not None:
-            parts.append(ref_audio_tokens.unsqueeze(0).to(self.device))
+            parts.append(ref_audio_tokens.unsqueeze(0).to(target_device))
         parts.append(target_audio_tokens)
         cond_input_ids = torch.cat(parts, dim=2)
 
@@ -1106,7 +1153,7 @@ class OmniVoice(PreTrainedModel):
             cond_audio_start_idx -= ref_audio_tokens.size(-1)
 
         cond_audio_mask = torch.zeros(
-            1, cond_total_length, dtype=torch.bool, device=self.device
+            1, cond_total_length, dtype=torch.bool, device=target_device
         )
         cond_audio_mask[0, cond_audio_start_idx:] = True
 
@@ -1152,6 +1199,7 @@ class OmniVoice(PreTrainedModel):
                 task.langs[i],
                 task.instructs[i],
                 gen_config.denoise,
+                device=torch.device(self.device),
             )
             for i in range(B)
         ]
@@ -1159,41 +1207,55 @@ class OmniVoice(PreTrainedModel):
         c_lens = [inp["input_ids"].size(2) for inp in inputs_list]
         max_c_len = max(c_lens)
         pad_id = self.config.audio_mask_id  # Or any other tokens
+        effective_batch_size = 2 * B
+        use_onnx_backbone = self._should_use_onnx_backbone(
+            batch_size=effective_batch_size,
+            seq_len=max_c_len,
+        )
+        runtime_device = (
+            torch.device("cpu") if use_onnx_backbone else torch.device(self.device)
+        )
 
         batch_input_ids = torch.full(
-            (2 * B, self.config.num_audio_codebook, max_c_len),
+            (effective_batch_size, self.config.num_audio_codebook, max_c_len),
             pad_id,
             dtype=torch.long,
-            device=self.device,
+            device=runtime_device,
         )
         batch_audio_mask = torch.zeros(
-            (2 * B, max_c_len), dtype=torch.bool, device=self.device
+            (effective_batch_size, max_c_len),
+            dtype=torch.bool,
+            device=runtime_device,
         )
         batch_attention_mask = torch.zeros(
-            (2 * B, 1, max_c_len, max_c_len), dtype=torch.bool, device=self.device
+            (effective_batch_size, 1, max_c_len, max_c_len),
+            dtype=torch.bool,
+            device=runtime_device,
         )
 
         for i, inp in enumerate(inputs_list):
             c_len, u_len = c_lens[i], task.target_lens[i]
+            input_ids = inp["input_ids"].to(runtime_device)
+            audio_mask = inp["audio_mask"].to(runtime_device)
 
             # Cond (0 ~ B-1)
-            batch_input_ids[i, :, :c_len] = inp["input_ids"]
-            batch_audio_mask[i, :c_len] = inp["audio_mask"]
+            batch_input_ids[i, :, :c_len] = input_ids
+            batch_audio_mask[i, :c_len] = audio_mask
             batch_attention_mask[i, :, :c_len, :c_len] = True
 
             # Uncond (B ~ 2B-1)
-            batch_input_ids[B + i, :, :u_len] = inp["input_ids"][..., -u_len:]
-            batch_audio_mask[B + i, :u_len] = inp["audio_mask"][..., -u_len:]
+            batch_input_ids[B + i, :, :u_len] = input_ids[..., -u_len:]
+            batch_audio_mask[B + i, :u_len] = audio_mask[..., -u_len:]
             batch_attention_mask[B + i, :, :u_len, :u_len] = True
             if max_c_len > u_len:
-                pad_diag = torch.arange(u_len, max_c_len, device=self.device)
+                pad_diag = torch.arange(u_len, max_c_len, device=runtime_device)
                 batch_attention_mask[B + i, :, pad_diag, pad_diag] = True
 
         tokens = torch.full(
             (B, self.config.num_audio_codebook, max(task.target_lens)),
             self.config.audio_mask_id,
             dtype=torch.long,
-            device=self.device,
+            device=runtime_device,
         )
 
         timesteps = _get_time_steps(
@@ -1221,15 +1283,22 @@ class OmniVoice(PreTrainedModel):
             schedules.append(sched)
 
         layer_ids = torch.arange(
-            self.config.num_audio_codebook, device=self.device
+            self.config.num_audio_codebook, device=runtime_device
         ).view(1, -1, 1)
 
         for step in range(gen_config.num_step):
-            batch_logits = self(
-                input_ids=batch_input_ids,
-                audio_mask=batch_audio_mask,
-                attention_mask=batch_attention_mask,
-            ).logits.to(torch.float32)
+            if use_onnx_backbone:
+                batch_logits = self._onnx_backbone.run(
+                    input_ids=batch_input_ids,
+                    audio_mask=batch_audio_mask,
+                    attention_mask=batch_attention_mask,
+                )
+            else:
+                batch_logits = self(
+                    input_ids=batch_input_ids,
+                    audio_mask=batch_audio_mask,
+                    attention_mask=batch_attention_mask,
+                ).logits.to(torch.float32)
 
             for i in range(B):
                 k = schedules[i][step]

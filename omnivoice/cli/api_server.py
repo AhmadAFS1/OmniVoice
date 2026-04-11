@@ -28,10 +28,12 @@ import io
 import logging
 import os
 import tempfile
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from threading import Lock
 from typing import Optional
+from uuid import uuid4
 
 import soundfile as sf
 import torch
@@ -95,6 +97,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip loading Whisper ASR at startup. Clone mode without ref_text "
         "will load ASR on demand instead.",
     )
+    parser.add_argument(
+        "--onnx-backbone",
+        default=None,
+        help="Optional ONNX backbone path for phase-1 ORT acceleration.",
+    )
+    parser.add_argument(
+        "--onnx-provider",
+        default="auto",
+        choices=["auto", "cpu", "coreml"],
+        help="Provider preference when --onnx-backbone is set.",
+    )
+    parser.add_argument(
+        "--save-dir",
+        default=None,
+        help="Optional directory to persist a copy of each generated WAV.",
+    )
     return parser
 
 
@@ -126,10 +144,41 @@ def _audio_to_wav_bytes(audio: torch.Tensor, sampling_rate: int) -> bytes:
     return buffer.getvalue()
 
 
+def _slugify_filename_text(text: str, max_len: int = 40) -> str:
+    chars = []
+    for ch in text.lower():
+        if ch.isalnum():
+            chars.append(ch)
+        elif ch in {" ", "-", "_"}:
+            chars.append("-")
+    slug = "".join(chars).strip("-")
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return (slug[:max_len].rstrip("-")) or "audio"
+
+
+def _persist_wav_bytes(
+    wav_bytes: bytes,
+    save_dir: Path,
+    mode: GenerateMode,
+    text: str,
+) -> Path:
+    save_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    text_slug = _slugify_filename_text(text)
+    filename = f"{timestamp}_{mode.value}_{text_slug}_{uuid4().hex[:8]}.wav"
+    output_path = save_dir / filename
+    output_path.write_bytes(wav_bytes)
+    return output_path
+
+
 def create_app(
     model_checkpoint: str = "k2-fsa/OmniVoice",
     device: Optional[str] = None,
     load_asr: bool = True,
+    onnx_backbone: Optional[str] = None,
+    onnx_provider: str = "auto",
+    save_dir: Optional[str] = None,
 ) -> FastAPI:
     device = device or get_best_device()
     dtype = get_inference_dtype(device)
@@ -141,6 +190,13 @@ def create_app(
         dtype=dtype,
         load_asr=load_asr,
     )
+    if onnx_backbone:
+        logger.info(
+            "Loading ONNX backbone from %s with provider=%s ...",
+            onnx_backbone,
+            onnx_provider,
+        )
+        model.load_onnx_backbone(onnx_backbone, provider=onnx_provider)
     logger.info("Model loaded. Sampling rate=%s", model.sampling_rate)
 
     app = FastAPI(
@@ -152,6 +208,9 @@ def create_app(
     app.state.model_checkpoint = model_checkpoint
     app.state.device = device
     app.state.generate_lock = Lock()
+    app.state.onnx_backbone = onnx_backbone
+    app.state.onnx_provider = onnx_provider if onnx_backbone else None
+    app.state.save_dir = Path(save_dir).expanduser() if save_dir else None
 
     @app.get("/health")
     def health() -> dict:
@@ -161,6 +220,9 @@ def create_app(
             "device": app.state.device,
             "sampling_rate": app.state.model.sampling_rate,
             "asr_loaded": app.state.model._asr_pipe is not None,
+            "onnx_backbone": app.state.onnx_backbone,
+            "onnx_provider": app.state.onnx_provider,
+            "save_dir": str(app.state.save_dir) if app.state.save_dir else None,
         }
 
     @app.get("/languages")
@@ -280,10 +342,19 @@ def create_app(
                 audios = app.state.model.generate(**kwargs)
 
             wav_bytes = _audio_to_wav_bytes(audios[0], app.state.model.sampling_rate)
+            headers = {"Content-Disposition": 'inline; filename="omnivoice.wav"'}
+            if app.state.save_dir is not None:
+                saved_path = _persist_wav_bytes(
+                    wav_bytes=wav_bytes,
+                    save_dir=app.state.save_dir,
+                    mode=mode,
+                    text=cleaned_text,
+                )
+                headers["X-OmniVoice-Saved-Path"] = str(saved_path)
             return Response(
                 content=wav_bytes,
                 media_type="audio/wav",
-                headers={"Content-Disposition": 'inline; filename="omnivoice.wav"'},
+                headers=headers,
             )
         except HTTPException:
             raise
@@ -318,6 +389,9 @@ def main(argv=None) -> int:
         model_checkpoint=args.model,
         device=args.device,
         load_asr=not args.no_asr,
+        onnx_backbone=args.onnx_backbone,
+        onnx_provider=args.onnx_provider,
+        save_dir=args.save_dir,
     )
 
     try:

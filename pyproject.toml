@@ -54,11 +54,17 @@ eval = [
     "unidecode",            # Unicode normalization
 ]
 
+onnx = [
+    "onnx>=1.17",
+    "onnxruntime>=1.18",
+]
+
 [project.scripts]
 omnivoice-infer = "omnivoice.cli.infer:main"
 omnivoice-infer-batch = "omnivoice.cli.infer_batch:main"
 omnivoice-demo = "omnivoice.cli.demo:main"
 omnivoice-api = "omnivoice.cli.api_server:main"
+omnivoice-export-onnx-backbone = "omnivoice.scripts.export_onnx_backbone:main"
 
 [project.urls]
 Homepage = "https://github.com/k2-fsa/OmniVoice"
