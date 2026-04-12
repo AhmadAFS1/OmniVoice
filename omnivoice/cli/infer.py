@@ -131,7 +131,7 @@ def get_parser() -> argparse.ArgumentParser:
         "--coreml_compute_units",
         type=str,
         choices=["all", "cpu_only", "cpu_and_gpu", "cpu_and_ne"],
-        default="all",
+        default="cpu_and_ne",
         help="Compute-unit preference when --coreml_backbone is set.",
     )
     parser.add_argument(
@@ -181,6 +181,12 @@ def main():
     logging.basicConfig(format=formatter, level=logging.INFO, force=True)
 
     args = get_parser().parse_args()
+
+    if (args.coreml_backbone or args.coreml_decoder) and args.ref_audio and not args.ref_text:
+        raise SystemExit(
+            "Clone mode with native Core ML runtime requires --ref_text. "
+            "Whisper auto-transcription is not part of the Apple-native path."
+        )
 
     device = args.device or get_best_device()
     logging.info(f"Loading model from {args.model} on {device} ...")

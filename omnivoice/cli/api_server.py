@@ -109,7 +109,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--coreml-compute-units",
-        default="all",
+        default="cpu_and_ne",
         choices=["all", "cpu_only", "cpu_and_gpu", "cpu_and_ne"],
         help="Compute-unit preference when --coreml-backbone is set.",
     )
@@ -216,7 +216,7 @@ def create_app(
     device: Optional[str] = None,
     load_asr: bool = True,
     coreml_backbone: Optional[str] = None,
-    coreml_compute_units: str = "all",
+    coreml_compute_units: str = "cpu_and_ne",
     coreml_decoder: Optional[str] = None,
     coreml_decoder_compute_units: str = "all",
     onnx_backbone: Optional[str] = None,
@@ -311,6 +311,8 @@ def create_app(
             "device": app.state.device,
             "sampling_rate": app.state.model.sampling_rate,
             "asr_loaded": app.state.model._asr_pipe is not None,
+            "native_coreml_runtime_active": app.state.model._native_coreml_runtime_enabled(),
+            "native_clone_requires_ref_text": app.state.model._native_coreml_runtime_enabled(),
             "coreml_backbone": app.state.coreml_backbone,
             "coreml_compute_units": app.state.coreml_compute_units,
             "coreml_backbone_sessions": (
@@ -426,6 +428,18 @@ def create_app(
             raise HTTPException(
                 status_code=400,
                 detail="ref_audio is required for clone mode.",
+            )
+        if (
+            mode == GenerateMode.clone
+            and app.state.model._native_coreml_runtime_enabled()
+            and cleaned_ref_text is None
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Clone mode with native Core ML runtime requires ref_text. "
+                    "Whisper auto-transcription is not part of the Apple-native path."
+                ),
             )
 
         generation_config = OmniVoiceGenerationConfig(

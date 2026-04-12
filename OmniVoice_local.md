@@ -1424,21 +1424,129 @@ Caveats:
   - `error: attempting to parse a byte at the end of the bytecode`
   - generation still completed successfully in the validated smoke test
 
-Current blocker discovered during revalidation:
+Revalidation update as of 2026-04-11 evening:
 
-- the existing direct Core ML backbone artifact at
+- the original direct Core ML backbone artifact at
   - `/Users/ahmadsmacair/OmniVoice/artifacts/coreml_dynamic/omnivoice_backbone_dynamic_seq128.mlpackage`
-  now fails direct `predict()` in the native runtime with:
+  was indeed corrupted from the earlier disk-full run and failed direct `predict()` with:
   - `RuntimeError: Error compiling model: "compiler error: Error reading protobuf spec. validator error: Model specification version field missing or corrupt."`
-- a fresh re-export attempt to a new backbone `.mlpackage` failed during save because the machine ran out of disk space:
-  - `LLVM ERROR: IO failure on output stream: No space left on device`
+- after restoring disk headroom and re-exporting with:
 
-So the direct Core ML backbone implementation exists, but the currently validated state is:
+```bash
+HF_HUB_DISABLE_XET=1 uv run omnivoice-export-coreml-backbone \
+  --model k2-fsa/OmniVoice \
+  --output /Users/ahmadsmacair/OmniVoice/artifacts/coreml_dynamic/omnivoice_backbone_dynamic_seq128_v2.mlpackage \
+  --seq-len 128 \
+  --batch-size 2 \
+  --dynamic-seq \
+  --target macos13
+```
+
+  a fresh valid artifact was produced:
+  - `/Users/ahmadsmacair/OmniVoice/artifacts/coreml_dynamic/omnivoice_backbone_dynamic_seq128_v2.mlpackage`
+  - `/Users/ahmadsmacair/OmniVoice/artifacts/coreml_dynamic/omnivoice_backbone_dynamic_seq128_v2.metadata.json`
+
+Fresh validation results:
+
+- direct backbone runtime load completed successfully
+- direct backbone dummy prediction completed successfully:
+  - output shape: `(2, 8, 16, 1025)`
+  - output dtype: `torch.float32`
+- direct decoder runtime load still completed successfully
+- direct decoder dummy prediction still completed successfully:
+  - output shape: `(1, 1, 15360)`
+  - output dtype: `torch.float32`
+- the missing-`ref_text` clone path is now explicitly blocked for native Core ML:
+  - CLI now exits immediately with:
+    - `Clone mode with native Core ML runtime requires --ref_text. Whisper auto-transcription is not part of the Apple-native path.`
+  - API now returns a `400` with the same rule
+
+Fully native design-mode CLI smoke test now succeeded with:
+
+- native Core ML backbone:
+  - `/Users/ahmadsmacair/OmniVoice/artifacts/coreml_dynamic/omnivoice_backbone_dynamic_seq128_v2.mlpackage`
+- native Core ML decoder:
+  - `/Users/ahmadsmacair/OmniVoice/artifacts/coreml_dynamic/omnivoice_decoder_dynamic_seq128.mlpackage`
+- output:
+  - `/Users/ahmadsmacair/OmniVoice/local/coreml_full_design.wav`
+- observed profile:
+  - `total=10.735s`
+  - `backbone=8.620s`
+  - `decoder=1.781s`
+  - `coreml_backbone_path=/Users/ahmadsmacair/OmniVoice/artifacts/coreml_dynamic/omnivoice_backbone_dynamic_seq128_v2.mlpackage`
+  - `coreml_decoder_path=/Users/ahmadsmacair/OmniVoice/artifacts/coreml_dynamic/omnivoice_decoder_dynamic_seq128.mlpackage`
+
+Backbone parity investigation on 2026-04-11 found the direct cause of the
+"broken audio" regression in the native Core ML path:
+
+- CLI and API are **not** the cause; both call the same `model.generate(...)`
+  path in `omnivoice/models/omnivoice.py`
+- the native Core ML **backbone** is highly sensitive to `compute_units`
+- with `compute_units=all` or `cpu_and_gpu`, backbone parity against PyTorch is
+  badly broken on this model:
+  - `max_abs ~= 80.9`
+  - `mean_abs ~= 12.85`
+  - `argmax_mismatch ~= 0.66 - 0.68`
+- with `compute_units=cpu_only` or `cpu_and_ne`, backbone parity becomes much
+  tighter:
+  - `max_abs ~= 0.106`
+  - `mean_abs ~= 0.0147`
+  - `argmax_mismatch ~= 0.0083`
+
+Decoder parity is much tighter in all tested compute-unit modes and does not
+appear to be the main cause of the catastrophic audio failure:
+
+- `all` / `cpu_and_gpu`:
+  - `max_abs ~= 0.0038`
+  - `mean_abs ~= 0.00035`
+- `cpu_only` / `cpu_and_ne`:
+  - `max_abs ~= 0.0113`
+  - `mean_abs ~= 0.00103`
+
+Conclusion:
+
+- the catastrophic audio failure is caused by the **native Core ML backbone**
+  when it is allowed to use the GPU path
+- the recommended backbone setting is now:
+  - `cpu_and_ne`
+- the recommended decoder setting remains:
+  - `all`
+
+After switching the backbone to `cpu_and_ne`, the fully native design-mode CLI
+smoke test still worked and improved versus the broken `all` backbone run:
+
+- output:
+  - `/Users/ahmadsmacair/OmniVoice/local/coreml_full_design_cpuane.wav`
+- observed profile:
+  - `total=8.155s`
+  - `backbone=7.371s`
+  - `decoder=0.470s`
+  - `coreml_backbone_compute_units=cpu_and_ne`
+  - `coreml_decoder_compute_units=all`
+
+Clone-mode smoke test with `ref_text` also succeeded, but it exposed the current backbone shape limit:
+
+- output:
+  - `/Users/ahmadsmacair/OmniVoice/local/coreml_full_clone.wav`
+- observed warning:
+  - `Falling back from native Core ML backbone: export shape mismatch; no loaded native Core ML backbone bucket can satisfy the request (batch_size=2, seq_len=349, loaded=dynamic)`
+- observed profile:
+  - `total=7.213s`
+  - `preprocess=4.013s`
+  - `backbone=1.198s`
+  - `decoder=1.605s`
+  - `coreml_backbone_path=None`
+  - `coreml_decoder_path=/Users/ahmadsmacair/OmniVoice/artifacts/coreml_dynamic/omnivoice_decoder_dynamic_seq128.mlpackage`
+
+So the current direct Core ML state is:
 
 - export path implemented
 - runtime path implemented
 - CLI/API wiring implemented
-- backbone artifact reliability is still blocked by the local environment and needs a clean re-export
+- native Core ML backbone validated for short design-mode requests
+- native Core ML decoder validated
+- clone mode no longer silently pulls Whisper when the native path is enabled
+- clone mode still needs a larger backbone bucket to keep the backbone on native Core ML
 
 #### Direct native Core ML decoder implementation
 
@@ -1484,7 +1592,7 @@ Validation:
 
 Current local package sizes:
 
-- backbone `.mlpackage`: about `310M`
+- backbone `.mlpackage` v2: about `1.1G`
 - decoder `.mlpackage`: about `41M`
 
 ### Phase 4: Full Native Apple Path
@@ -1495,10 +1603,14 @@ Goal:
 
 Implementation steps:
 
-1. Re-export the direct Core ML backbone cleanly once disk headroom is available.
-2. Revalidate native backbone `predict()` and then re-run full generation with:
-   - direct Core ML backbone
-   - direct Core ML decoder
+1. Export larger native Core ML backbone buckets so clone-mode and longer design prompts stay on the native backbone path:
+   - `seq256`
+   - `seq384`
+   - `seq512`
+2. Re-run the full native design/clone smoke tests and confirm:
+   - `coreml_backbone_path` is populated
+   - `coreml_decoder_path` is populated
+   - no PyTorch backbone fallback happens for the target request sizes
 3. Build a minimal native harness that loads the backbone and decoder artifacts and runs one full generation request.
 4. Measure wall time, first-audio latency, memory use, and thermal behavior on a real iPhone.
 5. Only after that, design the React Native bridge around the winning runtime path.
@@ -1506,8 +1618,8 @@ Implementation steps:
 Exit criteria:
 
 - One end-to-end prompt works on-device without Python.
-- Backbone and decoder both run through the chosen native Apple path.
-- Clone-critical runtime pieces are either migrated or explicitly moved off-device by design.
+- Backbone and decoder both run through the chosen native Apple path for the target request sizes.
+- Clone mode requires explicit `ref_text`, with no Whisper dependency on-device.
 
 ### Immediate next task
 

@@ -232,6 +232,7 @@ class OmniVoice(PreTrainedModel):
         self._onnx_decoder = None
         self._coreml_fallback_messages = set()
         self._coreml_decoder_fallback_messages = set()
+        self._coreml_backbone_warning_messages = set()
         self._onnx_fallback_messages = set()
         self._onnx_decoder_fallback_messages = set()
         self._last_backbone_runtime_sec = 0.0
@@ -422,11 +423,40 @@ class OmniVoice(PreTrainedModel):
         self._coreml_decoder_fallback_messages.add(reason)
         logger.warning("Falling back from native Core ML decoder: %s", reason)
 
+    def _log_coreml_backbone_warning_once(self, reason: str) -> None:
+        if reason in self._coreml_backbone_warning_messages:
+            return
+        self._coreml_backbone_warning_messages.add(reason)
+        logger.warning("Native Core ML backbone warning: %s", reason)
+
     def _log_onnx_decoder_fallback_once(self, reason: str) -> None:
         if reason in self._onnx_decoder_fallback_messages:
             return
         self._onnx_decoder_fallback_messages.add(reason)
         logger.warning("Falling back to PyTorch decoder: %s", reason)
+
+    def _native_coreml_runtime_enabled(self) -> bool:
+        return self._coreml_backbone is not None or self._coreml_decoder is not None
+
+    def _validate_native_coreml_clone_inputs(
+        self,
+        ref_text_list: list[Optional[str]],
+        voice_clone_prompt: VoiceClonePrompt | list[VoiceClonePrompt] | None,
+        ref_audio: Any,
+    ) -> None:
+        if voice_clone_prompt is not None or ref_audio is None:
+            return
+        if not self._native_coreml_runtime_enabled():
+            return
+        missing_indices = [str(i) for i, item in enumerate(ref_text_list) if item is None]
+        if not missing_indices:
+            return
+        raise RuntimeError(
+            "Clone mode with native Core ML runtime requires ref_text for every "
+            "reference audio item. Whisper auto-transcription is not part of the "
+            "Apple-native path. Missing ref_text at batch indices: "
+            + ", ".join(missing_indices)
+        )
 
     def _should_use_coreml_backbone(
         self,
@@ -448,6 +478,12 @@ class OmniVoice(PreTrainedModel):
                 f"the request (batch_size={batch_size}, seq_len={seq_len}, loaded={available or 'none'})"
             )
             return False
+        if self._coreml_backbone.compute_units in {"all", "cpu_and_gpu"}:
+            self._log_coreml_backbone_warning_once(
+                "compute_units="
+                f"{self._coreml_backbone.compute_units} can produce large backbone parity drift on this model. "
+                "Prefer cpu_and_ne for the backbone."
+            )
         return True
 
     def _should_use_onnx_backbone(
@@ -1230,6 +1266,11 @@ class OmniVoice(PreTrainedModel):
             # ref_audio (ref_text will be auto-transcribed if not given).
             ref_text_list = self._ensure_list(ref_text, batch_size, auto_repeat=False)
             ref_audio_list = self._ensure_list(ref_audio, batch_size, auto_repeat=False)
+            self._validate_native_coreml_clone_inputs(
+                ref_text_list=ref_text_list,
+                voice_clone_prompt=voice_clone_prompt,
+                ref_audio=ref_audio,
+            )
 
             voice_clone_prompt = []
             for i in range(len(ref_text_list)):
