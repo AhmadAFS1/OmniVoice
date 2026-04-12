@@ -100,7 +100,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--onnx-backbone",
         default=None,
-        help="Optional ONNX backbone path for phase-1 ORT acceleration.",
+        help="Optional ONNX backbone file, directory, or comma-separated path list for ORT/CoreML acceleration.",
+    )
+    parser.add_argument(
+        "--coreml-backbone",
+        default=None,
+        help="Optional native Core ML backbone .mlpackage path, directory, or comma-separated path list.",
+    )
+    parser.add_argument(
+        "--coreml-compute-units",
+        default="all",
+        choices=["all", "cpu_only", "cpu_and_gpu", "cpu_and_ne"],
+        help="Compute-unit preference when --coreml-backbone is set.",
+    )
+    parser.add_argument(
+        "--coreml-decoder",
+        default=None,
+        help="Optional native Core ML decoder .mlpackage path, directory, or comma-separated path list.",
+    )
+    parser.add_argument(
+        "--coreml-decoder-compute-units",
+        default="all",
+        choices=["all", "cpu_only", "cpu_and_gpu", "cpu_and_ne"],
+        help="Compute-unit preference when --coreml-decoder is set.",
     )
     parser.add_argument(
         "--onnx-provider",
@@ -193,6 +215,10 @@ def create_app(
     model_checkpoint: str = "k2-fsa/OmniVoice",
     device: Optional[str] = None,
     load_asr: bool = True,
+    coreml_backbone: Optional[str] = None,
+    coreml_compute_units: str = "all",
+    coreml_decoder: Optional[str] = None,
+    coreml_decoder_compute_units: str = "all",
     onnx_backbone: Optional[str] = None,
     onnx_provider: str = "auto",
     onnx_backbone_allow_fixed_padding: bool = False,
@@ -210,6 +236,26 @@ def create_app(
         dtype=dtype,
         load_asr=load_asr,
     )
+    if coreml_backbone:
+        logger.info(
+            "Loading native Core ML backbone from %s with compute_units=%s ...",
+            coreml_backbone,
+            coreml_compute_units,
+        )
+        model.load_coreml_backbone(
+            coreml_backbone,
+            compute_units=coreml_compute_units,
+        )
+    if coreml_decoder:
+        logger.info(
+            "Loading native Core ML decoder from %s with compute_units=%s ...",
+            coreml_decoder,
+            coreml_decoder_compute_units,
+        )
+        model.load_coreml_decoder(
+            coreml_decoder,
+            compute_units=coreml_decoder_compute_units,
+        )
     if onnx_backbone:
         logger.info(
             "Loading ONNX backbone from %s with provider=%s (allow_fixed_padding=%s) ...",
@@ -240,6 +286,12 @@ def create_app(
     app.state.model_checkpoint = model_checkpoint
     app.state.device = device
     app.state.generate_lock = Lock()
+    app.state.coreml_backbone = coreml_backbone
+    app.state.coreml_compute_units = coreml_compute_units if coreml_backbone else None
+    app.state.coreml_decoder = coreml_decoder
+    app.state.coreml_decoder_compute_units = (
+        coreml_decoder_compute_units if coreml_decoder else None
+    )
     app.state.onnx_backbone = onnx_backbone
     app.state.onnx_provider = onnx_provider if onnx_backbone else None
     app.state.onnx_backbone_allow_fixed_padding = (
@@ -259,9 +311,28 @@ def create_app(
             "device": app.state.device,
             "sampling_rate": app.state.model.sampling_rate,
             "asr_loaded": app.state.model._asr_pipe is not None,
+            "coreml_backbone": app.state.coreml_backbone,
+            "coreml_compute_units": app.state.coreml_compute_units,
+            "coreml_backbone_sessions": (
+                app.state.model._coreml_backbone.describe_sessions()
+                if app.state.model._coreml_backbone is not None
+                else None
+            ),
+            "coreml_decoder": app.state.coreml_decoder,
+            "coreml_decoder_compute_units": app.state.coreml_decoder_compute_units,
+            "coreml_decoder_sessions": (
+                app.state.model._coreml_decoder.describe_sessions()
+                if app.state.model._coreml_decoder is not None
+                else None
+            ),
             "onnx_backbone": app.state.onnx_backbone,
             "onnx_provider": app.state.onnx_provider,
             "onnx_backbone_allow_fixed_padding": app.state.onnx_backbone_allow_fixed_padding,
+            "onnx_backbone_sessions": (
+                app.state.model._onnx_backbone.describe_sessions()
+                if app.state.model._onnx_backbone is not None
+                else None
+            ),
             "onnx_decoder": app.state.onnx_decoder,
             "onnx_decoder_provider": app.state.onnx_decoder_provider,
             "onnx_runtime_providers": (
@@ -441,6 +512,10 @@ def main(argv=None) -> int:
         model_checkpoint=args.model,
         device=args.device,
         load_asr=not args.no_asr,
+        coreml_backbone=args.coreml_backbone,
+        coreml_compute_units=args.coreml_compute_units,
+        coreml_decoder=args.coreml_decoder,
+        coreml_decoder_compute_units=args.coreml_decoder_compute_units,
         onnx_backbone=args.onnx_backbone,
         onnx_provider=args.onnx_provider,
         onnx_backbone_allow_fixed_padding=args.onnx_backbone_allow_fixed_padding,

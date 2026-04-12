@@ -226,8 +226,12 @@ class OmniVoice(PreTrainedModel):
         self.duration_estimator = None
         self.sampling_rate = None
         self._asr_pipe = None
+        self._coreml_backbone = None
+        self._coreml_decoder = None
         self._onnx_backbone = None
         self._onnx_decoder = None
+        self._coreml_fallback_messages = set()
+        self._coreml_decoder_fallback_messages = set()
         self._onnx_fallback_messages = set()
         self._onnx_decoder_fallback_messages = set()
         self._last_backbone_runtime_sec = 0.0
@@ -293,7 +297,7 @@ class OmniVoice(PreTrainedModel):
 
     def load_onnx_backbone(
         self,
-        onnx_path: str,
+        onnx_path: str | list[str],
         provider: str = "auto",
         allow_fixed_shape_padding: bool = False,
     ) -> None:
@@ -303,22 +307,75 @@ class OmniVoice(PreTrainedModel):
         loop while keeping the existing Python generation orchestration,
         post-processing, and voice-clone prompt path.
         """
-        from omnivoice.utils.onnx_runtime import OnnxBackboneSession
+        from omnivoice.utils.onnx_runtime import OnnxBackboneRouter
 
-        self._onnx_backbone = OnnxBackboneSession.create(
+        self._onnx_backbone = OnnxBackboneRouter.create(
             onnx_path,
             provider=provider,
             allow_fixed_shape_padding=allow_fixed_shape_padding,
         )
         self._onnx_fallback_messages.clear()
+        session_descriptions = self._onnx_backbone.describe_sessions()
         logger.info(
-            "Loaded ONNX backbone from %s with providers=%s (fixed_batch=%s, fixed_seq_len=%s, allow_fixed_shape_padding=%s)",
-            onnx_path,
+            "Loaded %d ONNX backbone session(s) from %s with providers=%s (allow_fixed_shape_padding=%s): %s",
+            len(session_descriptions),
+            self._onnx_backbone.paths,
             self._onnx_backbone.providers,
-            self._onnx_backbone.fixed_batch_size,
-            self._onnx_backbone.fixed_seq_len,
             self._onnx_backbone.allow_fixed_shape_padding,
+            session_descriptions,
         )
+
+    def load_coreml_backbone(
+        self,
+        model_path: str | list[str],
+        compute_units: str = "all",
+    ) -> None:
+        """Load a native Core ML backbone session or router."""
+        from omnivoice.utils.coreml_runtime import CoreMLBackboneRouter
+
+        self._coreml_backbone = CoreMLBackboneRouter.create(
+            model_path,
+            compute_units=compute_units,
+        )
+        self._coreml_fallback_messages.clear()
+        session_descriptions = self._coreml_backbone.describe_sessions()
+        logger.info(
+            "Loaded %d native Core ML backbone session(s) from %s with compute_units=%s: %s",
+            len(session_descriptions),
+            self._coreml_backbone.paths,
+            self._coreml_backbone.compute_units,
+            session_descriptions,
+        )
+
+    def unload_coreml_backbone(self) -> None:
+        self._coreml_backbone = None
+        self._coreml_fallback_messages.clear()
+
+    def load_coreml_decoder(
+        self,
+        model_path: str | list[str],
+        compute_units: str = "all",
+    ) -> None:
+        """Load a native Core ML decoder session or router."""
+        from omnivoice.utils.coreml_runtime import CoreMLAudioDecoderRouter
+
+        self._coreml_decoder = CoreMLAudioDecoderRouter.create(
+            model_path,
+            compute_units=compute_units,
+        )
+        self._coreml_decoder_fallback_messages.clear()
+        session_descriptions = self._coreml_decoder.describe_sessions()
+        logger.info(
+            "Loaded %d native Core ML decoder session(s) from %s with compute_units=%s: %s",
+            len(session_descriptions),
+            self._coreml_decoder.paths,
+            self._coreml_decoder.compute_units,
+            session_descriptions,
+        )
+
+    def unload_coreml_decoder(self) -> None:
+        self._coreml_decoder = None
+        self._coreml_decoder_fallback_messages.clear()
 
     def unload_onnx_backbone(self) -> None:
         self._onnx_backbone = None
@@ -353,11 +410,45 @@ class OmniVoice(PreTrainedModel):
         self._onnx_fallback_messages.add(reason)
         logger.warning("Falling back to PyTorch backbone: %s", reason)
 
+    def _log_coreml_fallback_once(self, reason: str) -> None:
+        if reason in self._coreml_fallback_messages:
+            return
+        self._coreml_fallback_messages.add(reason)
+        logger.warning("Falling back from native Core ML backbone: %s", reason)
+
+    def _log_coreml_decoder_fallback_once(self, reason: str) -> None:
+        if reason in self._coreml_decoder_fallback_messages:
+            return
+        self._coreml_decoder_fallback_messages.add(reason)
+        logger.warning("Falling back from native Core ML decoder: %s", reason)
+
     def _log_onnx_decoder_fallback_once(self, reason: str) -> None:
         if reason in self._onnx_decoder_fallback_messages:
             return
         self._onnx_decoder_fallback_messages.add(reason)
         logger.warning("Falling back to PyTorch decoder: %s", reason)
+
+    def _should_use_coreml_backbone(
+        self,
+        batch_size: int,
+        seq_len: int,
+    ) -> bool:
+        if self._coreml_backbone is None:
+            return False
+        if not self._coreml_backbone.supports(batch_size=batch_size, seq_len=seq_len):
+            descriptions = self._coreml_backbone.describe_sessions()
+            available = ", ".join(
+                "dynamic"
+                if d["fixed_seq_len"] is None
+                else f"seq{d['fixed_seq_len']}"
+                for d in descriptions
+            )
+            self._log_coreml_fallback_once(
+                "export shape mismatch; no loaded native Core ML backbone bucket can satisfy "
+                f"the request (batch_size={batch_size}, seq_len={seq_len}, loaded={available or 'none'})"
+            )
+            return False
+        return True
 
     def _should_use_onnx_backbone(
         self,
@@ -367,10 +458,16 @@ class OmniVoice(PreTrainedModel):
         if self._onnx_backbone is None:
             return False
         if not self._onnx_backbone.supports(batch_size=batch_size, seq_len=seq_len):
+            descriptions = self._onnx_backbone.describe_sessions()
+            available = ", ".join(
+                "dynamic"
+                if d["fixed_seq_len"] is None
+                else f"seq{d['fixed_seq_len']}"
+                for d in descriptions
+            )
             padding_hint = (
-                "export shape mismatch; fixed-shape exports require an exact batch/sequence match"
-                if not self._onnx_backbone.allow_fixed_shape_padding
-                else "export shape mismatch; request is larger than the loaded fixed-shape ONNX backbone"
+                "export shape mismatch; no loaded ONNX backbone bucket can satisfy the request "
+                f"(batch_size={batch_size}, seq_len={seq_len}, loaded={available or 'none'})"
             )
             self._log_onnx_fallback_once(
                 padding_hint
@@ -388,6 +485,29 @@ class OmniVoice(PreTrainedModel):
         ):
             self._log_onnx_decoder_fallback_once(
                 "export shape mismatch; fixed-shape exports require an exact codebook/sequence match"
+            )
+            return False
+        return True
+
+    def _should_use_coreml_decoder(self, seq_len: int) -> bool:
+        if self._coreml_decoder is None:
+            return False
+        if not self._coreml_decoder.supports(
+            batch_size=1,
+            num_codebooks=self.config.num_audio_codebook,
+            seq_len=seq_len,
+        ):
+            descriptions = self._coreml_decoder.describe_sessions()
+            available = ", ".join(
+                "dynamic"
+                if d["fixed_seq_len"] is None
+                else f"seq{d['fixed_seq_len']}"
+                for d in descriptions
+            )
+            self._log_coreml_decoder_fallback_once(
+                "export shape mismatch; no loaded native Core ML decoder bucket can satisfy "
+                f"the request (batch_size=1, num_codebooks={self.config.num_audio_codebook}, "
+                f"seq_len={seq_len}, loaded={available or 'none'})"
             )
             return False
         return True
@@ -709,9 +829,33 @@ class OmniVoice(PreTrainedModel):
         profile["total_sec"] = time.perf_counter() - generation_start
         profile["batch_size"] = full_task.batch_size
         profile["num_step"] = gen_config.num_step
+        if self._coreml_backbone is not None:
+            profile["coreml_backbone_path"] = self._coreml_backbone.last_selected_path
+            profile["coreml_backbone_fixed_seq_len"] = (
+                self._coreml_backbone.last_selected_fixed_seq_len
+            )
+            profile["coreml_backbone_compute_units"] = (
+                self._coreml_backbone.last_selected_compute_units
+            )
+        if self._coreml_decoder is not None:
+            profile["coreml_decoder_path"] = self._coreml_decoder.last_selected_path
+            profile["coreml_decoder_fixed_seq_len"] = (
+                self._coreml_decoder.last_selected_fixed_seq_len
+            )
+            profile["coreml_decoder_compute_units"] = (
+                self._coreml_decoder.last_selected_compute_units
+            )
+        if self._onnx_backbone is not None:
+            profile["onnx_backbone_path"] = self._onnx_backbone.last_selected_path
+            profile["onnx_backbone_providers"] = (
+                list(self._onnx_backbone.last_selected_providers or [])
+            )
+            profile["onnx_backbone_fixed_seq_len"] = (
+                self._onnx_backbone.last_selected_fixed_seq_len
+            )
         self._last_generation_profile = profile
         logger.info(
-            "Generation profile total=%.3fs preprocess=%.3fs iterative=%.3fs chunked=%.3fs decode=%.3fs postprocess=%.3fs backbone=%.3fs decoder=%.3fs",
+            "Generation profile total=%.3fs preprocess=%.3fs iterative=%.3fs chunked=%.3fs decode=%.3fs postprocess=%.3fs backbone=%.3fs decoder=%.3fs coreml_backbone_path=%s coreml_backbone_fixed_seq_len=%s coreml_backbone_compute_units=%s coreml_decoder_path=%s coreml_decoder_fixed_seq_len=%s coreml_decoder_compute_units=%s onnx_backbone_path=%s onnx_backbone_fixed_seq_len=%s onnx_backbone_providers=%s",
             profile["total_sec"],
             profile["preprocess_sec"],
             profile["iterative_sec"],
@@ -720,6 +864,15 @@ class OmniVoice(PreTrainedModel):
             profile["postprocess_sec"],
             profile["backbone_sec"],
             profile["decoder_sec"],
+            profile.get("coreml_backbone_path"),
+            profile.get("coreml_backbone_fixed_seq_len"),
+            profile.get("coreml_backbone_compute_units"),
+            profile.get("coreml_decoder_path"),
+            profile.get("coreml_decoder_fixed_seq_len"),
+            profile.get("coreml_decoder_compute_units"),
+            profile.get("onnx_backbone_path"),
+            profile.get("onnx_backbone_fixed_seq_len"),
+            profile.get("onnx_backbone_providers"),
         )
 
         return generated_audios
@@ -847,7 +1000,9 @@ class OmniVoice(PreTrainedModel):
         def _decode_tokens(token_tensor: torch.Tensor) -> torch.Tensor:
             nonlocal decode_sec
             decode_start = time.perf_counter()
-            if self._should_use_onnx_decoder(seq_len=int(token_tensor.size(-1))):
+            if self._should_use_coreml_decoder(seq_len=int(token_tensor.size(-1))):
+                decoded = self._coreml_decoder.run(token_tensor.unsqueeze(0).cpu())[0].cpu()
+            elif self._should_use_onnx_decoder(seq_len=int(token_tensor.size(-1))):
                 decoded = self._onnx_decoder.run(token_tensor.unsqueeze(0).cpu())[0].cpu()
             else:
                 decoded = (
@@ -1315,12 +1470,18 @@ class OmniVoice(PreTrainedModel):
         max_c_len = max(c_lens)
         pad_id = self.config.audio_mask_id  # Or any other tokens
         effective_batch_size = 2 * B
-        use_onnx_backbone = self._should_use_onnx_backbone(
+        use_coreml_backbone = self._should_use_coreml_backbone(
             batch_size=effective_batch_size,
             seq_len=max_c_len,
         )
+        use_onnx_backbone = self._should_use_onnx_backbone(
+            batch_size=effective_batch_size,
+            seq_len=max_c_len,
+        ) if not use_coreml_backbone else False
         runtime_device = (
-            torch.device("cpu") if use_onnx_backbone else torch.device(self.device)
+            torch.device("cpu")
+            if use_coreml_backbone or use_onnx_backbone
+            else torch.device(self.device)
         )
 
         batch_input_ids = torch.full(
@@ -1396,7 +1557,13 @@ class OmniVoice(PreTrainedModel):
 
         for step in range(gen_config.num_step):
             backbone_start = time.perf_counter()
-            if use_onnx_backbone:
+            if use_coreml_backbone:
+                batch_logits = self._coreml_backbone.run(
+                    input_ids=batch_input_ids,
+                    audio_mask=batch_audio_mask,
+                    attention_mask=batch_attention_mask,
+                )
+            elif use_onnx_backbone:
                 batch_logits = self._onnx_backbone.run(
                     input_ids=batch_input_ids,
                     audio_mask=batch_audio_mask,

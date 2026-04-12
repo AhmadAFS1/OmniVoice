@@ -59,6 +59,10 @@ onnx = [
     "onnxruntime>=1.18",
 ]
 
+coreml = [
+    "coremltools>=9.0",
+]
+
 [project.scripts]
 omnivoice-infer = "omnivoice.cli.infer:main"
 omnivoice-infer-batch = "omnivoice.cli.infer_batch:main"
@@ -66,6 +70,8 @@ omnivoice-demo = "omnivoice.cli.demo:main"
 omnivoice-api = "omnivoice.cli.api_server:main"
 omnivoice-export-onnx-backbone = "omnivoice.scripts.export_onnx_backbone:main"
 omnivoice-export-onnx-decoder = "omnivoice.scripts.export_onnx_decoder:main"
+omnivoice-export-coreml-backbone = "omnivoice.scripts.export_coreml_backbone:main"
+omnivoice-export-coreml-decoder = "omnivoice.scripts.export_coreml_decoder:main"
 
 [project.urls]
 Homepage = "https://github.com/k2-fsa/OmniVoice"

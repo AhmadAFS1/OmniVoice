@@ -48,6 +48,17 @@ def _build_provider_list(ort_module, preference: ProviderPreference) -> list[Any
     return providers
 
 
+def _provider_loaded(
+    requested: ProviderPreference,
+    actual_providers: list[str],
+) -> bool:
+    if requested == "coreml":
+        return "CoreMLExecutionProvider" in actual_providers
+    if requested == "cpu":
+        return "CPUExecutionProvider" in actual_providers
+    return True
+
+
 def _build_coreml_provider_options(
     onnx_path: str,
     model_kind: Literal["backbone", "decoder"],
@@ -68,6 +79,41 @@ def _build_coreml_provider_options(
         options["ProfileComputePlan"] = "1"
 
     return options
+
+
+def _normalize_onnx_paths(onnx_paths: str | list[str]) -> list[str]:
+    raw_items = [onnx_paths] if isinstance(onnx_paths, str) else list(onnx_paths)
+    resolved_paths: list[str] = []
+
+    for raw_item in raw_items:
+        for item in str(raw_item).split(","):
+            item = item.strip()
+            if not item:
+                continue
+
+            path = Path(item).expanduser()
+            if path.is_dir():
+                onnx_files = sorted(str(p.resolve()) for p in path.rglob("*.onnx"))
+                if not onnx_files:
+                    raise FileNotFoundError(
+                        f"No .onnx files were found under directory: {path}"
+                    )
+                resolved_paths.extend(onnx_files)
+            else:
+                resolved_paths.append(str(path.resolve()))
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for path in resolved_paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        deduped.append(path)
+
+    if not deduped:
+        raise ValueError("No ONNX backbone paths were provided.")
+
+    return deduped
 
 
 @dataclass
@@ -111,6 +157,12 @@ class OnnxBackboneSession:
             sess_options=session_options,
             providers=providers,
         )
+        actual_providers = session.get_providers()
+        if not _provider_loaded(provider, actual_providers):
+            raise RuntimeError(
+                f"Requested provider={provider} for ONNX backbone {onnx_path}, "
+                f"but ONNX Runtime loaded providers={actual_providers}."
+            )
 
         inputs = {i.name: i.shape for i in session.get_inputs()}
         output_name = session.get_outputs()[0].name
@@ -121,7 +173,7 @@ class OnnxBackboneSession:
         return cls(
             path=onnx_path,
             session=session,
-            providers=session.get_providers(),
+            providers=actual_providers,
             fixed_batch_size=_maybe_int_dim(batch_shape),
             fixed_seq_len=_maybe_int_dim(seq_shape),
             allow_fixed_shape_padding=allow_fixed_shape_padding,
@@ -226,6 +278,145 @@ class OnnxBackboneSession:
 
 
 @dataclass
+class OnnxBackboneRouter:
+    paths: list[str]
+    sessions: list[OnnxBackboneSession]
+    providers: list[str]
+    fixed_batch_size: int | None
+    fixed_seq_len: int | None
+    allow_fixed_shape_padding: bool
+    last_selected_path: str | None = None
+    last_selected_providers: list[str] | None = None
+    last_selected_fixed_seq_len: int | None = None
+
+    @classmethod
+    def create(
+        cls,
+        onnx_paths: str | list[str],
+        provider: ProviderPreference = "auto",
+        allow_fixed_shape_padding: bool = False,
+    ) -> "OnnxBackboneRouter":
+        paths = _normalize_onnx_paths(onnx_paths)
+        sessions: list[OnnxBackboneSession] = []
+        load_errors: list[str] = []
+        for path in paths:
+            try:
+                sessions.append(
+                    OnnxBackboneSession.create(
+                        path,
+                        provider=provider,
+                        allow_fixed_shape_padding=allow_fixed_shape_padding,
+                    )
+                )
+            except Exception as exc:
+                load_errors.append(f"{path}: {exc}")
+                logger.warning(
+                    "Skipping ONNX backbone session %s because it did not initialize with provider=%s: %s",
+                    path,
+                    provider,
+                    exc,
+                )
+
+        if not sessions:
+            details = "; ".join(load_errors) if load_errors else "no sessions loaded"
+            raise RuntimeError(
+                f"Failed to load any ONNX backbone sessions for provider={provider}. {details}"
+            )
+        sessions.sort(
+            key=lambda session: (
+                session.fixed_seq_len is None,
+                session.fixed_seq_len if session.fixed_seq_len is not None else float("inf"),
+                session.path,
+            )
+        )
+
+        providers: list[str] = []
+        for session in sessions:
+            for provider_name in session.providers:
+                if provider_name not in providers:
+                    providers.append(provider_name)
+
+        fixed_batch_sizes = {s.fixed_batch_size for s in sessions}
+        fixed_batch_size = (
+            next(iter(fixed_batch_sizes)) if len(fixed_batch_sizes) == 1 else None
+        )
+
+        return cls(
+            paths=paths,
+            sessions=sessions,
+            providers=providers,
+            fixed_batch_size=fixed_batch_size,
+            fixed_seq_len=None,
+            allow_fixed_shape_padding=allow_fixed_shape_padding,
+        )
+
+    def describe_sessions(self) -> list[dict[str, Any]]:
+        descriptions = []
+        for session in self.sessions:
+            descriptions.append(
+                {
+                    "path": session.path,
+                    "fixed_batch_size": session.fixed_batch_size,
+                    "fixed_seq_len": session.fixed_seq_len,
+                    "providers": session.providers,
+                    "allow_fixed_shape_padding": session.allow_fixed_shape_padding,
+                }
+            )
+        return descriptions
+
+    def select_session(
+        self,
+        batch_size: int,
+        seq_len: int,
+    ) -> OnnxBackboneSession | None:
+        best_fixed: OnnxBackboneSession | None = None
+        dynamic_fallback: OnnxBackboneSession | None = None
+
+        for session in self.sessions:
+            if not session.supports(batch_size=batch_size, seq_len=seq_len):
+                continue
+            if session.fixed_seq_len is None:
+                dynamic_fallback = session
+                continue
+            if best_fixed is None or session.fixed_seq_len < best_fixed.fixed_seq_len:
+                best_fixed = session
+
+        return best_fixed or dynamic_fallback
+
+    def supports(self, batch_size: int, seq_len: int) -> bool:
+        return self.select_session(batch_size=batch_size, seq_len=seq_len) is not None
+
+    def run(
+        self,
+        input_ids: torch.Tensor,
+        audio_mask: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size = int(input_ids.shape[0])
+        seq_len = int(input_ids.shape[-1])
+        session = self.select_session(batch_size=batch_size, seq_len=seq_len)
+        if session is None:
+            available = ", ".join(
+                "dynamic"
+                if s.fixed_seq_len is None
+                else f"seq{s.fixed_seq_len}"
+                for s in self.sessions
+            )
+            raise RuntimeError(
+                f"No loaded ONNX backbone session supports batch_size={batch_size}, seq_len={seq_len}. "
+                f"Loaded sessions: {available or 'none'}."
+            )
+        self.last_selected_path = session.path
+        self.last_selected_providers = list(session.providers)
+        self.last_selected_fixed_seq_len = session.fixed_seq_len
+        return session.run(
+            input_ids=input_ids,
+            audio_mask=audio_mask,
+            attention_mask=attention_mask,
+        )
+
+
+@dataclass
 class OnnxAudioDecoderSession:
     path: str
     session: Any
@@ -268,6 +459,12 @@ class OnnxAudioDecoderSession:
             sess_options=session_options,
             providers=providers,
         )
+        actual_providers = session.get_providers()
+        if not _provider_loaded(provider, actual_providers):
+            raise RuntimeError(
+                f"Requested provider={provider} for ONNX decoder {onnx_path}, "
+                f"but ONNX Runtime loaded providers={actual_providers}."
+            )
 
         inputs = {i.name: i.shape for i in session.get_inputs()}
         input_shape = inputs["audio_codes"]
@@ -276,7 +473,7 @@ class OnnxAudioDecoderSession:
         return cls(
             path=onnx_path,
             session=session,
-            providers=session.get_providers(),
+            providers=actual_providers,
             fixed_batch_size=_maybe_int_dim(input_shape[0]),
             fixed_num_codebooks=_maybe_int_dim(input_shape[1]),
             fixed_seq_len=_maybe_int_dim(input_shape[2]),

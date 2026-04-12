@@ -1024,7 +1024,7 @@ The next likely optimization path is no longer “fix CoreML EP”. That part is
 
 ## Current Plan
 
-As of 2026-04-11, the project is no longer blocked on ONNX quality or CoreML EP bring-up. The next work should focus on replacing the remaining PyTorch inference pieces and then validating a true mobile-style stack.
+As of 2026-04-11, the project is no longer blocked on ONNX quality parity. The main blocker is now the backbone runtime: it needs to move to direct native Core ML so Apple hardware can be used without ORT/CoreML partitioning overhead.
 
 ### What is done
 
@@ -1032,6 +1032,9 @@ As of 2026-04-11, the project is no longer blocked on ONNX quality or CoreML EP 
 - Fixed-shape padding is no longer the accepted path.
 - ONNX Runtime parity is good enough for design-mode audio quality.
 - CoreMLExecutionProvider is active for the dynamic backbone.
+- The runtime now enforces true CoreML instead of silently accepting CPU fallback when `provider=coreml` is requested.
+- The direct Core ML path is now the intended destination for the backbone, with ORT/CoreML kept mainly as a validation and comparison path.
+- A productionized direct native Core ML backbone export/runtime path now exists for local benchmarking.
 
 ### What is still missing
 
@@ -1039,25 +1042,30 @@ As of 2026-04-11, the project is no longer blocked on ONNX quality or CoreML EP 
 - Voice-clone prompt creation still runs in PyTorch.
 - The current server is still hybrid, not a real iOS deployment path.
 - CoreML-backed ONNX is still slower than PyTorch + MPS on this Mac.
+- Verified dynamic-CoreML backbone timings are still roughly `11-25s` depending on prompt length, with the backbone dominating almost all of that time.
+- The current fixed `seq128` ORT/CoreML artifact does not initialize with true CoreML on this machine.
+- The direct Core ML backbone path is implemented, but it is still in the first benchmarking phase and not yet the default runtime path for all requests.
+- The direct native Core ML backbone path is now implemented, but it still needs broader benchmarking and decoder/cloning integration before it can be treated as the default Apple path.
 
-### Phase 3: Full inference-path migration
+### Phase 3: Direct Core ML Backbone
 
 Goal:
 
-- Remove PyTorch from the inference-critical neural path.
+- Move the backbone off ONNX Runtime and onto direct native Core ML so GPU/ANE usage is controlled by Apple's runtime rather than ORT graph partitioning.
 
 Implementation steps:
 
-1. Export the Higgs audio decoder as its own model artifact.
-2. Add a runtime path that can execute the decoder without PyTorch.
-3. Validate decoder parity against the current PyTorch decoder with fixed token inputs.
-4. Re-run end-to-end design-mode tests with both backbone and decoder migrated.
-5. Re-run clone-mode tests with `ref_text` always supplied.
+1. Productionize direct Core ML backbone export from the current prototype script.
+2. Export the backbone as native `.mlpackage` artifacts, starting with the backbone because it is the dominant bottleneck.
+3. Add a native Core ML runtime path for the backbone in the local inference stack so it can be benchmarked against ORT/CoreML and PyTorch/MPS.
+4. Benchmark direct Core ML backbone latency and warm-run behavior on Mac before touching iPhone integration.
+5. After the backbone path is trusted, keep the decoder on CPU ORT temporarily and continue clone-mode validation.
 
 Exit criteria:
 
-- End-to-end audio quality remains aligned with the current PyTorch baseline.
-- The request path no longer depends on PyTorch for backbone or decoder execution.
+- A native Core ML backbone artifact runs end to end with correct audio quality.
+- The direct Core ML backbone beats or clearly characterizes the ORT/CoreML backbone path.
+- The resulting path is trustworthy enough to benchmark for iPhone feasibility.
 
 ### Phase 3 status as of 2026-04-11
 
@@ -1199,7 +1207,7 @@ What is still not true:
 
 #### Fixed-shape bucket experiment (CoreML backbone)
 
-Status as of 2026-04-11: a fixed-shape `seq128` backbone running through CoreML EP shows a large latency improvement versus the dynamic-shape CoreML backbone on this MacBook Air.
+Status as of 2026-04-11: the original `seq128` fixed-bucket timings looked promising, but after adding strict provider validation they cannot be treated as proof that the fixed bucket was actually running on true CoreML.
 
 Fixed-shape backbone artifact:
 
@@ -1210,7 +1218,7 @@ Server notes:
 - User tested via a server on `http://127.0.0.1:8008`.
 - The server saved WAVs under: `/Users/ahmadsmacair/OmniVoice/local/api_outputs/onnx_fixed128/` (from `x-omnivoice-saved-path`).
 
-Measured design-mode timings (`num_step=16`):
+Measured design-mode timings (`num_step=16`) from the earlier `8008` experiment:
 
 - Text: `Hello world.` -> `fixed128_total=3.629878`
 - Text: `This is a short test of local text to speech.` -> `fixed128_total=4.650628`
@@ -1222,7 +1230,264 @@ Saved output for the long-sentence run:
 
 One log line reported `dynamic_total=0.000482`, which is not plausible for real inference and is likely due to a curl formatting/line-continuation issue rather than an actual generation runtime.
 
-### Phase 4: Native Apple deployment path
+What later validation showed:
+
+- the fixed `seq128` artifact does **not** initialize with true `CoreMLExecutionProvider` on this machine
+- ORT reports `SystemError : 20` during CoreML EP setup for that artifact
+- before the strict-provider fix, ORT would silently fall back to CPU and continue
+- so the earlier `seq128` timing numbers should be treated as "interesting earlier behavior" rather than verified fixed-bucket CoreML throughput
+- the old `fixed128_long=14.736434` result is very likely explained by fallback behavior in the earlier runtime:
+  - the fixed bucket could not run on true CoreML
+  - that server was started without `--onnx-backbone-allow-fixed-padding`
+  - for a long sentence, `seq128` cannot serve the request directly
+  - fallback warnings were deduplicated, so later requests could use a PyTorch backbone path without printing the same warning again
+
+#### Verified dynamic CoreML timings
+
+After strict CoreML enforcement and per-request backbone-path logging were added, the clean dynamic-CoreML measurements on `http://127.0.0.1:8007` are:
+
+- Text: `Hello world.` -> `11.590467`
+- Text: `Hello world. this is just a test to see how this thing works` -> `24.746319`
+
+Server-side generation profiles for the same dynamic-CoreML server:
+
+- Short request:
+  - `total=12.681s`
+  - `iterative=12.285s`
+  - `backbone=11.907s`
+  - `decoder=0.378s`
+- Warm short request:
+  - `total=11.571s`
+  - `iterative=11.223s`
+  - `backbone=11.150s`
+  - `decoder=0.344s`
+- Longer request:
+  - `total=24.736s`
+  - `iterative=24.095s`
+  - `backbone=23.898s`
+  - `decoder=0.626s`
+
+These runs explicitly logged:
+
+- `onnx_backbone_path=/Users/ahmadsmacair/OmniVoice/artifacts/onnx_dynamic/omnivoice_backbone_dynamic.onnx`
+- `onnx_backbone_fixed_seq_len=None`
+- `onnx_backbone_providers=['CoreMLExecutionProvider', 'CPUExecutionProvider']`
+
+So these are the first trustworthy dynamic ONNX + CoreML backbone timings after the runtime was made strict about rejecting fake-CoreML sessions.
+
+#### Bucket routing implementation
+
+Status as of 2026-04-11: the inference runtime now supports loading multiple ONNX backbone exports and routing each request to the smallest compatible backbone bucket.
+
+Implemented behavior:
+
+- `--onnx-backbone` can now point to:
+  - a single ONNX file
+  - a directory containing multiple `.onnx` backbone exports
+  - a comma-separated list of ONNX paths
+- the runtime loads all matching backbone sessions
+- requests are routed to the smallest fixed-shape session that can satisfy the request
+- if no fixed bucket can satisfy the request, the runtime falls back to a dynamic session if one is loaded
+
+Current selection rule:
+
+- prefer the smallest compatible fixed `seq_len`
+- otherwise use the loaded dynamic export
+
+This is now implemented in:
+
+- `omnivoice/utils/onnx_runtime.py`
+- `omnivoice/models/omnivoice.py`
+- `omnivoice/cli/api_server.py`
+- `omnivoice/cli/infer.py`
+
+Smoke test result:
+
+- loaded:
+  - `artifacts/onnx_fixed/seq128/omnivoice_backbone_bs2_seq128.onnx`
+  - `artifacts/onnx_dynamic/omnivoice_backbone_dynamic.onnx`
+- selection behavior:
+  - `seq_len=64` -> fixed `seq128`
+  - `seq_len=128` -> fixed `seq128`
+  - `seq_len=129` -> dynamic backbone
+  - `seq_len=300` -> dynamic backbone
+
+Important caveat from the smoke test:
+
+- on this machine, directly loading the current `seq128` fixed artifact through CoreML EP triggers `SystemError : 20`
+- after the strict-provider fix, that failed fixed session is now rejected instead of being treated as usable
+- the dynamic artifact still loads with `CoreMLExecutionProvider` + `CPUExecutionProvider`
+
+So the bucket router itself is implemented and selecting correctly, but fixed buckets are only useful if they can actually initialize with CoreML. Right now the current `seq128` ORT/CoreML artifact does not.
+
+#### Strict CoreML enforcement
+
+Status as of 2026-04-11: the runtime now treats `provider=coreml` as a hard requirement instead of allowing silent CPU fallback.
+
+What changed:
+
+- ONNX backbone and decoder session creation now verifies the requested provider actually loaded
+- if `provider=coreml` is requested and ORT only loads `CPUExecutionProvider`, that session is rejected
+- a single explicit fixed-bucket path that cannot load on CoreML now fails startup
+- a mixed list like `fixed + dynamic` now keeps only the sessions that truly loaded with CoreML
+
+Validated behavior:
+
+- single fixed path:
+  - `/Users/ahmadsmacair/OmniVoice/artifacts/onnx_fixed/seq128/omnivoice_backbone_bs2_seq128.onnx`
+  - `provider=coreml`
+  - result: startup fails with `RuntimeError` because actual providers are `['CPUExecutionProvider']`
+- mixed fixed + dynamic path:
+  - fixed `seq128` session is skipped
+  - dynamic backbone remains loaded with `['CoreMLExecutionProvider', 'CPUExecutionProvider']`
+
+The generation profile log now also records which ONNX backbone session actually served the request:
+
+- `onnx_backbone_path`
+- `onnx_backbone_fixed_seq_len`
+- `onnx_backbone_providers`
+
+This removes the earlier ambiguity around whether a request used `dynamic-coreml`, `fixed-cpu`, or a PyTorch fallback.
+
+#### Direct native Core ML backbone implementation
+
+Status as of 2026-04-11: the direct native Core ML backbone path is implemented in code, but the currently exported backbone `.mlpackage` is not reliable enough to call the full Apple path complete.
+
+What was added:
+
+- `omnivoice/models/coreml_backbone.py`
+- `omnivoice/utils/coreml_runtime.py`
+- `omnivoice/scripts/export_coreml_backbone.py`
+- CLI/API flags for `--coreml-backbone` and `--coreml-compute-units`
+- health/profile reporting for native Core ML backbone selection
+
+Packaging:
+
+- optional dependency group:
+  - `coreml`
+- install command:
+
+```bash
+uv sync --extra coreml --extra onnx
+```
+
+Exporter command:
+
+```bash
+uv run omnivoice-export-coreml-backbone \
+  --model k2-fsa/OmniVoice \
+  --output /Users/ahmadsmacair/OmniVoice/artifacts/coreml_dynamic/omnivoice_backbone_dynamic_seq128.mlpackage \
+  --seq-len 128 \
+  --batch-size 2 \
+  --dynamic-seq \
+  --target macos13
+```
+
+This produces:
+
+- `/Users/ahmadsmacair/OmniVoice/artifacts/coreml_dynamic/omnivoice_backbone_dynamic_seq128.mlpackage`
+- `/Users/ahmadsmacair/OmniVoice/artifacts/coreml_dynamic/omnivoice_backbone_dynamic_seq128.metadata.json`
+
+Earlier local CLI smoke test:
+
+```bash
+uv run python -m omnivoice.cli.infer \
+  --model k2-fsa/OmniVoice \
+  --device mps \
+  --coreml_backbone /Users/ahmadsmacair/OmniVoice/artifacts/coreml_dynamic/omnivoice_backbone_dynamic_seq128.mlpackage \
+  --coreml_compute_units all \
+  --onnx_decoder /Users/ahmadsmacair/OmniVoice/artifacts/onnx_dynamic/omnivoice_decoder_dynamic.onnx \
+  --onnx_decoder_provider cpu \
+  --text "Hello world." \
+  --instruct "female, american accent" \
+  --num_step 1 \
+  --output /Users/ahmadsmacair/OmniVoice/local/coreml_direct_test.wav
+```
+
+Observed result:
+
+- generation completed successfully
+- saved file:
+  - `/Users/ahmadsmacair/OmniVoice/local/coreml_direct_test.wav`
+- generation profile:
+  - `total=7.039s`
+  - `iterative=6.632s`
+  - `backbone=6.329s`
+  - `decoder=0.364s`
+  - `coreml_backbone_path=/Users/ahmadsmacair/OmniVoice/artifacts/coreml_dynamic/omnivoice_backbone_dynamic_seq128.mlpackage`
+  - `coreml_backbone_compute_units=all`
+
+Caveats:
+
+- `coremltools==9.0` warns that `torch==2.8.0` is not a tested combination
+- local runs print an Apple runtime cache warning:
+  - `error: attempting to parse a byte at the end of the bytecode`
+  - generation still completed successfully in the validated smoke test
+
+Current blocker discovered during revalidation:
+
+- the existing direct Core ML backbone artifact at
+  - `/Users/ahmadsmacair/OmniVoice/artifacts/coreml_dynamic/omnivoice_backbone_dynamic_seq128.mlpackage`
+  now fails direct `predict()` in the native runtime with:
+  - `RuntimeError: Error compiling model: "compiler error: Error reading protobuf spec. validator error: Model specification version field missing or corrupt."`
+- a fresh re-export attempt to a new backbone `.mlpackage` failed during save because the machine ran out of disk space:
+  - `LLVM ERROR: IO failure on output stream: No space left on device`
+
+So the direct Core ML backbone implementation exists, but the currently validated state is:
+
+- export path implemented
+- runtime path implemented
+- CLI/API wiring implemented
+- backbone artifact reliability is still blocked by the local environment and needs a clean re-export
+
+#### Direct native Core ML decoder implementation
+
+Status as of 2026-04-11: the native Core ML decoder path is now implemented and validated locally.
+
+What was added:
+
+- `omnivoice/models/coreml_decoder.py`
+- `omnivoice/scripts/export_coreml_decoder.py`
+- decoder support inside `omnivoice/utils/coreml_runtime.py`
+- model integration in `omnivoice/models/omnivoice.py`
+- CLI/API flags for:
+  - `--coreml_decoder`
+  - `--coreml_decoder_compute_units`
+- compatibility wrappers:
+  - `scripts/export_audio_decoder.py`
+  - `scripts/export_coreml_decoder.py`
+
+Exporter command:
+
+```bash
+uv run omnivoice-export-coreml-decoder \
+  --model k2-fsa/OmniVoice \
+  --output /Users/ahmadsmacair/OmniVoice/artifacts/coreml_dynamic/omnivoice_decoder_dynamic_seq128.mlpackage \
+  --seq-len 128 \
+  --dynamic-seq \
+  --target macos13
+```
+
+This produces:
+
+- `/Users/ahmadsmacair/OmniVoice/artifacts/coreml_dynamic/omnivoice_decoder_dynamic_seq128.mlpackage`
+- `/Users/ahmadsmacair/OmniVoice/artifacts/coreml_dynamic/omnivoice_decoder_dynamic_seq128.metadata.json`
+
+Validation:
+
+- export completed successfully
+- runtime load completed successfully
+- direct dummy prediction completed successfully
+- observed decoder runtime output:
+  - output shape: `(1, 1, 15360)`
+  - output dtype: `torch.float32`
+
+Current local package sizes:
+
+- backbone `.mlpackage`: about `310M`
+- decoder `.mlpackage`: about `41M`
+
+### Phase 4: Full Native Apple Path
 
 Goal:
 
@@ -1230,23 +1495,29 @@ Goal:
 
 Implementation steps:
 
-1. Decide whether to keep ONNX Runtime Mobile or move the backbone and decoder to direct Core ML artifacts.
-2. Build a minimal native harness that loads the migrated models and runs one full generation request.
-3. Measure wall time, first-audio latency, memory use, and thermal behavior on a real iPhone.
-4. Only after that, design the React Native bridge around the winning runtime path.
+1. Re-export the direct Core ML backbone cleanly once disk headroom is available.
+2. Revalidate native backbone `predict()` and then re-run full generation with:
+   - direct Core ML backbone
+   - direct Core ML decoder
+3. Build a minimal native harness that loads the backbone and decoder artifacts and runs one full generation request.
+4. Measure wall time, first-audio latency, memory use, and thermal behavior on a real iPhone.
+5. Only after that, design the React Native bridge around the winning runtime path.
 
 Exit criteria:
 
 - One end-to-end prompt works on-device without Python.
-- Backbone, decoder, and clone-critical runtime pieces are all available in the chosen mobile stack.
+- Backbone and decoder both run through the chosen native Apple path.
+- Clone-critical runtime pieces are either migrated or explicitly moved off-device by design.
 
 ### Immediate next task
 
 The next implementation task is now:
 
-- revalidate clone mode with `ref_text` supplied and both ONNX artifacts loaded
+- free disk headroom, regenerate the direct Core ML backbone artifact, and revalidate full native generation with both backbone and decoder on Core ML
 
-After that, the next decision is whether the decoder should stay on ORT CPU for fidelity, move to a better CoreML configuration, or be converted to a direct Core ML artifact outside ONNX Runtime.
+After that:
+
+- decide whether clone-prompt creation stays off-device or also needs its own Apple-native migration path
 
 ### Repo-wide codebase audit (2026-04-11)
 
@@ -1298,7 +1569,7 @@ The bottleneck and blockers are now very clear:
 1. The repeated backbone call inside `_generate_iterative(...)` is still the dominant latency cost.
 2. Voice cloning is still not fully mobile-ready because prompt creation depends on PyTorch audio-token encoding, and clone mode without `ref_text` still depends on Whisper.
 3. The decoder is migrated to ONNX, but the best-fidelity path is still ORT CPU, not a clearly faster Apple-native decoder backend.
-4. The current direct Core ML export scripts in `scripts/` are prototype-level utilities, not a productionized deployment path.
+4. The current direct Core ML export scripts in `scripts/` are prototype-level utilities, and the next work should turn them into the primary backbone deployment path rather than leaving them as side experiments.
 5. None of the Python-side orchestration has been reimplemented in Swift or a native mobile runtime yet.
 
 #### What the audit says about the current phases
@@ -1327,30 +1598,28 @@ Phase 4:
 
 #### The most important repo-level insight
 
-The fixed-shape bucket experiment is now the strongest lever in the whole codebase.
+The backbone runtime path is now the strongest lever in the whole codebase.
 
 Why:
 
 - profiling in `omnivoice/models/omnivoice.py` already showed the backbone dominates runtime
 - dynamic ONNX + CoreML preserved quality but stayed slow
-- fixed `seq128` CoreML brought latency much closer to PyTorch MPS for short prompts
+- ORT/CoreML still leaves too much of the performance question inside ORT partitioning and fallback behavior
+- direct native Core ML is now the cleanest way to answer whether Apple hardware can actually make the backbone fast
 
 So the next performance phase should focus on the backbone shape strategy, not on post-processing, docs, training code, or evaluation code.
 
 #### Next steps, in order
 
-1. Formalize bucketed backbone exports and routing.
+1. Productionize direct native Core ML for the backbone.
 
-   Build and benchmark a real bucket set:
+   Start with:
 
-   - `seq128`
-   - `seq256`
-   - `seq384`
-   - `seq512`
+   - export `.mlpackage` backbone artifacts
+   - add a native runtime path
+   - benchmark direct Core ML against ORT/CoreML and PyTorch/MPS
 
-   Then route requests to the smallest valid bucket instead of relying on one dynamic export.
-
-   This is the highest-probability next speed win because the current `seq128` result already improved materially.
+   The backbone is the dominant bottleneck, so this is the highest-value next move.
 
 2. Revalidate clone mode end to end on the migrated path.
 

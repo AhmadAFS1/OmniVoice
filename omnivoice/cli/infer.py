@@ -119,7 +119,33 @@ def get_parser() -> argparse.ArgumentParser:
         "--onnx_backbone",
         type=str,
         default=None,
-        help="Optional ONNX backbone path for phase-1 ORT acceleration.",
+        help="Optional ONNX backbone file, directory, or comma-separated path list for ORT/CoreML acceleration.",
+    )
+    parser.add_argument(
+        "--coreml_backbone",
+        type=str,
+        default=None,
+        help="Optional native Core ML backbone .mlpackage path, directory, or comma-separated path list.",
+    )
+    parser.add_argument(
+        "--coreml_compute_units",
+        type=str,
+        choices=["all", "cpu_only", "cpu_and_gpu", "cpu_and_ne"],
+        default="all",
+        help="Compute-unit preference when --coreml_backbone is set.",
+    )
+    parser.add_argument(
+        "--coreml_decoder",
+        type=str,
+        default=None,
+        help="Optional native Core ML decoder .mlpackage path, directory, or comma-separated path list.",
+    )
+    parser.add_argument(
+        "--coreml_decoder_compute_units",
+        type=str,
+        choices=["all", "cpu_only", "cpu_and_gpu", "cpu_and_ne"],
+        default="all",
+        help="Compute-unit preference when --coreml_decoder is set.",
     )
     parser.add_argument(
         "--onnx_provider",
@@ -161,6 +187,26 @@ def main():
     model = OmniVoice.from_pretrained(
         args.model, device_map=device, dtype=torch.float16
     )
+    if args.coreml_backbone:
+        logging.info(
+            "Loading native Core ML backbone from %s with compute_units=%s ...",
+            args.coreml_backbone,
+            args.coreml_compute_units,
+        )
+        model.load_coreml_backbone(
+            args.coreml_backbone,
+            compute_units=args.coreml_compute_units,
+        )
+    if args.coreml_decoder:
+        logging.info(
+            "Loading native Core ML decoder from %s with compute_units=%s ...",
+            args.coreml_decoder,
+            args.coreml_decoder_compute_units,
+        )
+        model.load_coreml_decoder(
+            args.coreml_decoder,
+            compute_units=args.coreml_decoder_compute_units,
+        )
     if args.onnx_backbone:
         logging.info(
             "Loading ONNX backbone from %s with provider=%s (allow_fixed_padding=%s) ...",
