@@ -28,3 +28,12 @@ examples/exp*/
 .claude/
 *.wav
 *.jsonl
+
+# API server / benchmark artifacts
+api_server.log
+api_server.log.*
+*.headers
+headers.tmp
+bench.csv
+*-bench.csv
+generated_wavs/

@@ -29,7 +29,7 @@ import logging
 import os
 import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from threading import Lock
@@ -219,7 +219,11 @@ def _persist_wav_bytes(
 
 
 def _iso_utc_now() -> str:
-    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
 
 
 def _call_optional_model_method(
