@@ -68,10 +68,13 @@ omnivoice-infer = "omnivoice.cli.infer:main"
 omnivoice-infer-batch = "omnivoice.cli.infer_batch:main"
 omnivoice-demo = "omnivoice.cli.demo:main"
 omnivoice-api = "omnivoice.cli.api_server:main"
+omnivoice-benchmark-runtime = "omnivoice.scripts.benchmark_runtime:main"
 omnivoice-export-onnx-backbone = "omnivoice.scripts.export_onnx_backbone:main"
 omnivoice-export-onnx-decoder = "omnivoice.scripts.export_onnx_decoder:main"
 omnivoice-export-coreml-backbone = "omnivoice.scripts.export_coreml_backbone:main"
+omnivoice-export-coreml-backbone-buckets = "omnivoice.scripts.export_coreml_backbone_buckets:main"
 omnivoice-export-coreml-decoder = "omnivoice.scripts.export_coreml_decoder:main"
+omnivoice-debug-coreml-parity = "omnivoice.scripts.debug_coreml_parity:main"
 
 [project.urls]
 Homepage = "https://github.com/k2-fsa/OmniVoice"

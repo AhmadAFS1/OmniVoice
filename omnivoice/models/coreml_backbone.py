@@ -15,7 +15,7 @@ class OmniVoiceBackboneForCoreML(nn.Module):
     Inputs:
       input_ids: [B, C, S] int32
       audio_mask: [B, S] int32
-      attention_mask: [B, 1, S, S] int32
+      valid_lengths: [B] int32
 
     Output:
       audio_logits: [B, C, S, V] float32
@@ -43,11 +43,26 @@ class OmniVoiceBackboneForCoreML(nn.Module):
         self,
         input_ids: torch.Tensor,
         audio_mask: torch.Tensor,
-        attention_mask: torch.Tensor,
+        valid_lengths: torch.Tensor,
     ) -> torch.Tensor:
         input_ids = input_ids.to(dtype=torch.long)
         audio_mask = audio_mask.to(dtype=torch.bool)
-        attention_mask = attention_mask.to(dtype=torch.bool)
+        valid_lengths = valid_lengths.to(dtype=torch.long)
+
+        batch_size, _, seq_len = input_ids.shape
+        positions = torch.arange(seq_len, device=input_ids.device)
+        valid = (positions.unsqueeze(0) < valid_lengths.unsqueeze(1)).to(
+            dtype=torch.int32
+        )
+        prefix_mask = (
+            valid[:, None, :, None] * valid[:, None, None, :]
+        )
+        row_positions = positions.view(1, 1, seq_len, 1)
+        col_positions = positions.view(1, 1, 1, seq_len)
+        diag = (row_positions == col_positions).to(dtype=torch.int32)
+        invalid = (1 - valid).clamp(min=0)
+        pad_diag_mask = invalid[:, None, :, None] * diag
+        attention_mask = (prefix_mask + pad_diag_mask).to(dtype=torch.bool)
 
         text_embeds = self.text_embeddings(input_ids[:, 0, :])
         shifted_ids = (

@@ -1548,6 +1548,328 @@ So the current direct Core ML state is:
 - clone mode no longer silently pulls Whisper when the native path is enabled
 - clone mode still needs a larger backbone bucket to keep the backbone on native Core ML
 
+#### Native Core ML throughput validation
+
+Status as of 2026-04-11: native Core ML now has a repeatable benchmark path,
+and the safe backbone setting is currently **much slower** than the existing
+PyTorch + MPS path on this MacBook Air.
+
+New benchmark entrypoint:
+
+- `omnivoice-benchmark-runtime`
+
+Benchmark setup:
+
+- model:
+  - `/Users/ahmadsmacair/.cache/huggingface/hub/models--k2-fsa--OmniVoice/snapshots/29cde0ee295ee673d33e9ab570e7bbbe761c33b3`
+- prompt:
+  - `Hello world.`
+- instruct:
+  - `female, american accent`
+- steps:
+  - `num_step=16`
+- warmup:
+  - `1`
+- measured repeats:
+  - `2`
+
+PyTorch + MPS baseline:
+
+- mean wall time:
+  - `3.673s`
+- mean audio duration:
+  - `1.225s`
+- mean RTF:
+  - `3.006`
+- last profile:
+  - `backbone=3.129s`
+  - `decoder=0.499s`
+
+Direct native Core ML with safe settings:
+
+- backbone artifact:
+  - `/Users/ahmadsmacair/OmniVoice/artifacts/coreml_dynamic/omnivoice_backbone_dynamic_seq128_v2.mlpackage`
+- decoder artifact:
+  - `/Users/ahmadsmacair/OmniVoice/artifacts/coreml_dynamic/omnivoice_decoder_dynamic_seq128.mlpackage`
+- backbone compute units:
+  - `cpu_and_ne`
+- decoder compute units:
+  - `all`
+- mean wall time:
+  - `22.519s`
+- mean audio duration:
+  - `1.195s`
+- mean RTF:
+  - `18.848`
+- last profile:
+  - `backbone=22.181s`
+  - `decoder=0.115s`
+
+Interpretation:
+
+- native Core ML is now producing articulate audio with the safe backbone setting
+- the throughput cost is severe:
+  - about `6.1x` slower wall time than PyTorch + MPS on the same short prompt
+  - about `6.3x` worse RTF
+- the bottleneck is still overwhelmingly the **backbone**
+- this validates that the current safe Core ML configuration is **not yet** a
+  performance win and is probably not maximizing the Apple accelerator path in
+  a useful way for this model
+
+Current conclusion:
+
+- `backbone=cpu_and_ne` is the safe setting for audio fidelity
+- `decoder=all` is acceptable
+- this safe direct Core ML path is still too slow to treat as an iPhone-realistic
+  throughput result
+- the next optimization work should focus on:
+  - larger native Core ML backbone buckets
+  - bucket routing
+  - checking whether a different export/shape strategy can preserve parity while
+    using more acceleration
+
+Concrete next steps:
+
+1. Export **true static** native Core ML backbone buckets.
+
+   The current `seq128` backbone artifact was exported with `--dynamic-seq`, so
+   it is really a dynamic `1..128` shape, not a fixed 128-token bucket. That is
+   good for correctness, but it may still block good ANE optimization.
+
+   Start with:
+
+   - `seq64`
+   - `seq128`
+   - `seq256`
+   - `seq384`
+   - `seq512`
+
+   Keep one dynamic fallback artifact for oversized prompts.
+
+2. Validate parity for each static bucket before trusting its speed.
+
+   A fixed bucket is only useful if it preserves output quality. The earlier
+   ONNX/CoreML failures showed that padding or shape changes can easily break
+   logits and produce bad audio.
+
+   The current implementation work has started here:
+
+   - `omnivoice-export-coreml-backbone-buckets`
+   - `omnivoice-debug-coreml-parity`
+
+3. Benchmark the static buckets against:
+
+   - PyTorch + MPS
+   - native Core ML dynamic
+   - native Core ML static
+
+   Do this on the same prompt and same `num_step=16`, then compare:
+
+   - wall time
+   - RTF
+   - backbone runtime
+   - decoder runtime
+
+4. Only if a static bucket is both faithful and faster, treat it as the new
+   Apple backbone path.
+
+5. If static buckets are still too slow, the next model-side levers are:
+
+   - reduce `num_step`
+   - reduce or remove CFG cost
+   - quantize the backbone
+   - consider a smaller distilled backbone
+
+Why this is the next experiment:
+
+- Apple’s Core ML guidance says flexible input models are more likely to keep NE
+  performance when shapes are constrained to a finite known set rather than a
+  broad range.
+- The current backbone export still passes a full `[B, 1, S, S]` attention mask
+  every step, which makes the graph expensive and less accelerator-friendly.
+- The safe `cpu_and_ne` path is now correct enough to benchmark, but still too
+  slow to justify iPhone deployment.
+
+#### Static native Core ML bucket padding validation
+
+Status as of 2026-04-11: the native Core ML runtime now supports optional
+padding into fixed-shape backbone buckets, but the first real parity test shows
+that padded static buckets are currently **not usable**.
+
+Implementation added:
+
+- native Core ML bucket exporter:
+  - `omnivoice-export-coreml-backbone-buckets`
+- native Core ML padding support in:
+  - `omnivoice/utils/coreml_runtime.py`
+- native Core ML parity checker:
+  - `omnivoice-debug-coreml-parity`
+- CLI/API/benchmark flags for:
+  - `--coreml-backbone-allow-fixed-padding`
+
+First real padded static test:
+
+- bucket:
+  - `/Users/ahmadsmacair/OmniVoice/artifacts/coreml_buckets/seq64/omnivoice_backbone_bs2_seq64.mlpackage`
+- prompt:
+  - `Hello world.`
+- actual request shape:
+  - `batch_size=2`
+  - `seq_len=50`
+- compute units:
+  - `cpu_and_ne`
+- padding:
+  - enabled up to `seq64`
+
+Result:
+
+- selected path:
+  - `.../seq64/omnivoice_backbone_bs2_seq64.mlpackage`
+- selected fixed seq len:
+  - `64`
+- parity:
+  - `pt_unpadded_vs_pt_padded`
+    - `max_abs ~= 35.60`
+    - `mean_abs ~= 1.01`
+    - `argmax_mismatch_rate ~= 0.286`
+  - `pt_padded_vs_coreml`
+    - `max_abs ~= 152.50`
+    - `mean_abs ~= 54.21`
+    - `argmax_mismatch_rate = 1.0`
+
+Conclusion:
+
+- true static Core ML buckets are now implemented
+- optional padded routing is now implemented
+- but padding a shorter request into a larger static bucket breaks backbone
+  parity catastrophically on this model
+- this is the same class of failure that appeared earlier with padded fixed ONNX
+  exports
+
+Practical consequence:
+
+- static bucket padding is **not** a valid throughput path right now
+- any benchmark using padded static Core ML buckets would be meaningless because
+  the audio path is numerically broken
+- if bucketed Core ML is still desired, the next experiment must avoid padded
+  mismatch:
+  - exact-shape buckets for real request shapes, or
+  - a different model/export structure that does not react so badly to padded
+    sequence extension
+
+#### Exact-shape static native Core ML validation
+
+Status as of 2026-04-11: exact-shape static native Core ML was also tested, and
+it is currently **not faithful enough to use**.
+
+Exact artifact exported:
+
+- `/Users/ahmadsmacair/OmniVoice/artifacts/coreml_exact/seq50/omnivoice_backbone_bs2_seq50.mlpackage`
+
+Why `seq50`:
+
+- prompt:
+  - `Hello world.`
+- actual backbone request shape:
+  - `batch_size=2`
+  - `seq_len=50`
+- this avoids padding entirely and isolates whether true static export itself is
+  viable
+
+Parity results for exact `seq50`, `cpu_and_ne`:
+
+- selected path:
+  - `.../coreml_exact/seq50/omnivoice_backbone_bs2_seq50.mlpackage`
+- selected fixed seq len:
+  - `50`
+- parity:
+  - `pt_unpadded_vs_pt_padded`
+    - `max_abs = 0.0`
+    - `mean_abs = 0.0`
+    - `argmax_mismatch_rate = 0.0`
+  - `pt_padded_vs_coreml`
+    - `max_abs ~= 136.37`
+    - `mean_abs ~= 40.59`
+    - `argmax_mismatch_rate ~= 0.995`
+
+Parity results for exact `seq50`, `cpu_only`:
+
+- parity:
+  - `pt_padded_vs_coreml`
+    - `max_abs ~= 137.44`
+    - `mean_abs ~= 69.40`
+    - `argmax_mismatch_rate = 1.0`
+
+Conclusion:
+
+- the failure is **not** caused by padding
+- the failure is **not** specific to ANE-backed execution
+- the current static native Core ML backbone export is fidelity-broken even for
+  an exact request shape
+- because of that, static native Core ML should **not** be benchmarked for
+  speed yet
+
+Practical consequence:
+
+- the current trustworthy direct Core ML backbone path is still the dynamic
+  artifact:
+  - `/Users/ahmadsmacair/OmniVoice/artifacts/coreml_dynamic/omnivoice_backbone_dynamic_seq128_v2.mlpackage`
+- the next Core ML optimization step is no longer "try more static buckets"
+- the next step must be a different export structure for the backbone, likely:
+  - reduce or eliminate the explicit full `[B, 1, S, S]` attention mask input,
+    or
+  - otherwise change the backbone export so Core ML does not numerically drift
+    on static graphs
+
+#### Native Core ML `valid_lengths` refactor
+
+Status as of 2026-04-11: the backbone export/runtime path was refactored so the
+native Core ML backbone no longer takes a full explicit `[B, 1, S, S]`
+attention mask input. It now takes:
+
+- `input_ids: [B, C, S]`
+- `audio_mask: [B, S]`
+- `valid_lengths: [B]`
+
+and rebuilds the same top-left-square-plus-pad-diagonal mask internally inside
+the Core ML wrapper.
+
+Why this was tried:
+
+- the previous export exposed a large `O(S^2)` mask tensor as a model input
+- that is an ugly interface for Core ML and a plausible reason for poor static
+  export behavior
+
+Artifacts produced from the refactored path:
+
+- exact static:
+  - `/Users/ahmadsmacair/OmniVoice/artifacts/coreml_exact_v2/seq50/omnivoice_backbone_bs2_seq50_vl.mlpackage`
+- dynamic:
+  - `/Users/ahmadsmacair/OmniVoice/artifacts/coreml_dynamic_v3/omnivoice_backbone_dynamic_seq128_vl.mlpackage`
+
+Results:
+
+- exact static `seq50` remained broken:
+  - `cpu_and_ne`:
+    - `argmax_mismatch_rate ~= 0.995`
+  - `cpu_only`:
+    - `argmax_mismatch_rate = 1.0`
+- dynamic `seq128_vl` preserved the same parity as the old dynamic `seq128_v2`
+  path:
+  - `max_abs ~= 0.1666`
+  - `mean_abs ~= 0.0160`
+  - `argmax_mismatch_rate ~= 0.0325`
+
+Conclusion:
+
+- removing the explicit 4D attention-mask input was **not enough** to fix the
+  static native Core ML export problem
+- the static export is still fidelity-broken even with the simpler input
+  interface
+- the dynamic export remains the only trustworthy native Core ML backbone path
+- there is no validated throughput win from the `valid_lengths` refactor; the
+  partial runtime benchmark did not show an improvement worth keeping
+
 #### Direct native Core ML decoder implementation
 
 Status as of 2026-04-11: the native Core ML decoder path is now implemented and validated locally.

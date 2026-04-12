@@ -135,6 +135,12 @@ def get_parser() -> argparse.ArgumentParser:
         help="Compute-unit preference when --coreml_backbone is set.",
     )
     parser.add_argument(
+        "--coreml_backbone_allow_fixed_padding",
+        type=str2bool,
+        default=False,
+        help="Allow fixed-shape native Core ML backbone exports to pad shorter requests up to the exported seq-len.",
+    )
+    parser.add_argument(
         "--coreml_decoder",
         type=str,
         default=None,
@@ -202,6 +208,7 @@ def main():
         model.load_coreml_backbone(
             args.coreml_backbone,
             compute_units=args.coreml_compute_units,
+            allow_fixed_shape_padding=args.coreml_backbone_allow_fixed_padding,
         )
     if args.coreml_decoder:
         logging.info(

@@ -114,6 +114,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Compute-unit preference when --coreml-backbone is set.",
     )
     parser.add_argument(
+        "--coreml-backbone-allow-fixed-padding",
+        action="store_true",
+        default=False,
+        help="Allow fixed-shape native Core ML backbone exports to pad shorter requests up to the exported seq-len.",
+    )
+    parser.add_argument(
         "--coreml-decoder",
         default=None,
         help="Optional native Core ML decoder .mlpackage path, directory, or comma-separated path list.",
@@ -217,6 +223,7 @@ def create_app(
     load_asr: bool = True,
     coreml_backbone: Optional[str] = None,
     coreml_compute_units: str = "cpu_and_ne",
+    coreml_backbone_allow_fixed_padding: bool = False,
     coreml_decoder: Optional[str] = None,
     coreml_decoder_compute_units: str = "all",
     onnx_backbone: Optional[str] = None,
@@ -238,13 +245,15 @@ def create_app(
     )
     if coreml_backbone:
         logger.info(
-            "Loading native Core ML backbone from %s with compute_units=%s ...",
+            "Loading native Core ML backbone from %s with compute_units=%s (allow_fixed_padding=%s) ...",
             coreml_backbone,
             coreml_compute_units,
+            coreml_backbone_allow_fixed_padding,
         )
         model.load_coreml_backbone(
             coreml_backbone,
             compute_units=coreml_compute_units,
+            allow_fixed_shape_padding=coreml_backbone_allow_fixed_padding,
         )
     if coreml_decoder:
         logger.info(
@@ -288,6 +297,9 @@ def create_app(
     app.state.generate_lock = Lock()
     app.state.coreml_backbone = coreml_backbone
     app.state.coreml_compute_units = coreml_compute_units if coreml_backbone else None
+    app.state.coreml_backbone_allow_fixed_padding = (
+        coreml_backbone_allow_fixed_padding if coreml_backbone else None
+    )
     app.state.coreml_decoder = coreml_decoder
     app.state.coreml_decoder_compute_units = (
         coreml_decoder_compute_units if coreml_decoder else None
@@ -315,6 +327,7 @@ def create_app(
             "native_clone_requires_ref_text": app.state.model._native_coreml_runtime_enabled(),
             "coreml_backbone": app.state.coreml_backbone,
             "coreml_compute_units": app.state.coreml_compute_units,
+            "coreml_backbone_allow_fixed_padding": app.state.coreml_backbone_allow_fixed_padding,
             "coreml_backbone_sessions": (
                 app.state.model._coreml_backbone.describe_sessions()
                 if app.state.model._coreml_backbone is not None
@@ -528,6 +541,7 @@ def main(argv=None) -> int:
         load_asr=not args.no_asr,
         coreml_backbone=args.coreml_backbone,
         coreml_compute_units=args.coreml_compute_units,
+        coreml_backbone_allow_fixed_padding=args.coreml_backbone_allow_fixed_padding,
         coreml_decoder=args.coreml_decoder,
         coreml_decoder_compute_units=args.coreml_decoder_compute_units,
         onnx_backbone=args.onnx_backbone,

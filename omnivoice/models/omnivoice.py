@@ -330,6 +330,7 @@ class OmniVoice(PreTrainedModel):
         self,
         model_path: str | list[str],
         compute_units: str = "all",
+        allow_fixed_shape_padding: bool = False,
     ) -> None:
         """Load a native Core ML backbone session or router."""
         from omnivoice.utils.coreml_runtime import CoreMLBackboneRouter
@@ -337,14 +338,16 @@ class OmniVoice(PreTrainedModel):
         self._coreml_backbone = CoreMLBackboneRouter.create(
             model_path,
             compute_units=compute_units,
+            allow_fixed_shape_padding=allow_fixed_shape_padding,
         )
         self._coreml_fallback_messages.clear()
         session_descriptions = self._coreml_backbone.describe_sessions()
         logger.info(
-            "Loaded %d native Core ML backbone session(s) from %s with compute_units=%s: %s",
+            "Loaded %d native Core ML backbone session(s) from %s with compute_units=%s (allow_fixed_shape_padding=%s): %s",
             len(session_descriptions),
             self._coreml_backbone.paths,
             self._coreml_backbone.compute_units,
+            self._coreml_backbone.allow_fixed_shape_padding,
             session_descriptions,
         )
 
@@ -1536,6 +1539,11 @@ class OmniVoice(PreTrainedModel):
             dtype=torch.bool,
             device=runtime_device,
         )
+        batch_valid_lengths = torch.zeros(
+            (effective_batch_size,),
+            dtype=torch.int32,
+            device=runtime_device,
+        )
         batch_attention_mask = torch.zeros(
             (effective_batch_size, 1, max_c_len, max_c_len),
             dtype=torch.bool,
@@ -1550,11 +1558,13 @@ class OmniVoice(PreTrainedModel):
             # Cond (0 ~ B-1)
             batch_input_ids[i, :, :c_len] = input_ids
             batch_audio_mask[i, :c_len] = audio_mask
+            batch_valid_lengths[i] = c_len
             batch_attention_mask[i, :, :c_len, :c_len] = True
 
             # Uncond (B ~ 2B-1)
             batch_input_ids[B + i, :, :u_len] = input_ids[..., -u_len:]
             batch_audio_mask[B + i, :u_len] = audio_mask[..., -u_len:]
+            batch_valid_lengths[B + i] = u_len
             batch_attention_mask[B + i, :, :u_len, :u_len] = True
             if max_c_len > u_len:
                 pad_diag = torch.arange(u_len, max_c_len, device=runtime_device)
@@ -1603,6 +1613,7 @@ class OmniVoice(PreTrainedModel):
                     input_ids=batch_input_ids,
                     audio_mask=batch_audio_mask,
                     attention_mask=batch_attention_mask,
+                    valid_lengths=batch_valid_lengths,
                 )
             elif use_onnx_backbone:
                 batch_logits = self._onnx_backbone.run(

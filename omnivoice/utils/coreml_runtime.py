@@ -80,6 +80,8 @@ class CoreMLBackboneSession:
     fixed_seq_len: int | None
     max_seq_len: int | None
     dynamic_seq: bool
+    allow_fixed_shape_padding: bool
+    mask_mode: str
     output_name: str
 
     @classmethod
@@ -87,6 +89,7 @@ class CoreMLBackboneSession:
         cls,
         model_path: str,
         compute_units: ComputeUnitsPreference = "all",
+        allow_fixed_shape_padding: bool = False,
     ) -> "CoreMLBackboneSession":
         if sys.platform != "darwin":
             raise RuntimeError(
@@ -120,6 +123,8 @@ class CoreMLBackboneSession:
             fixed_seq_len=_maybe_int(metadata.get("fixed_seq_len")),
             max_seq_len=_maybe_int(metadata.get("max_seq_len")),
             dynamic_seq=bool(metadata.get("dynamic_seq", False)),
+            allow_fixed_shape_padding=allow_fixed_shape_padding,
+            mask_mode=str(metadata.get("mask_mode", "attention_mask")),
             output_name=output_name,
         )
 
@@ -127,22 +132,61 @@ class CoreMLBackboneSession:
         if self.fixed_batch_size is not None and batch_size != self.fixed_batch_size:
             return False
         if self.fixed_seq_len is not None:
-            return seq_len == self.fixed_seq_len
+            if seq_len == self.fixed_seq_len:
+                return True
+            if self.allow_fixed_shape_padding and seq_len < self.fixed_seq_len:
+                return True
+            return False
         if self.dynamic_seq and self.max_seq_len is not None:
             return seq_len <= self.max_seq_len
         return True
+
+    def _pad_inputs_to_fixed_seq_len(
+        self,
+        input_ids: torch.Tensor,
+        audio_mask: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        target_seq_len = self.fixed_seq_len
+        current_seq_len = int(input_ids.shape[-1])
+        if target_seq_len is None or current_seq_len >= target_seq_len:
+            return input_ids, audio_mask, attention_mask
+
+        padded_input_ids = torch.zeros(
+            (input_ids.shape[0], input_ids.shape[1], target_seq_len),
+            dtype=input_ids.dtype,
+        )
+        padded_input_ids[:, :, :current_seq_len] = input_ids
+
+        padded_audio_mask = torch.zeros(
+            (audio_mask.shape[0], target_seq_len),
+            dtype=audio_mask.dtype,
+        )
+        padded_audio_mask[:, :current_seq_len] = audio_mask
+
+        padded_attention_mask = torch.zeros(
+            (attention_mask.shape[0], 1, target_seq_len, target_seq_len),
+            dtype=attention_mask.dtype,
+        )
+        padded_attention_mask[:, :, :current_seq_len, :current_seq_len] = attention_mask
+        pad_diag = torch.arange(current_seq_len, target_seq_len)
+        padded_attention_mask[:, :, pad_diag, pad_diag] = True
+
+        return padded_input_ids, padded_audio_mask, padded_attention_mask
 
     def run(
         self,
         input_ids: torch.Tensor,
         audio_mask: torch.Tensor,
         attention_mask: torch.Tensor,
+        valid_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if input_ids.device.type != "cpu":
             raise RuntimeError("Native Core ML backbone expects CPU tensors as inputs.")
 
         batch_size = int(input_ids.shape[0])
-        seq_len = int(input_ids.shape[-1])
+        original_seq_len = int(input_ids.shape[-1])
+        seq_len = original_seq_len
         if not self.supports(batch_size=batch_size, seq_len=seq_len):
             raise RuntimeError(
                 f"Core ML backbone at {self.path} does not support batch_size={batch_size}, "
@@ -151,21 +195,42 @@ class CoreMLBackboneSession:
                 f"dynamic_seq={self.dynamic_seq}."
             )
 
-        outputs = self.model.predict(
-            {
-                "input_ids": np.ascontiguousarray(
-                    input_ids.numpy().astype(np.int32, copy=False)
-                ),
-                "audio_mask": np.ascontiguousarray(
-                    audio_mask.numpy().astype(np.int32, copy=False)
-                ),
-                "attention_mask": np.ascontiguousarray(
-                    attention_mask.numpy().astype(np.int32, copy=False)
-                ),
-            }
-        )
+        if (
+            self.fixed_seq_len is not None
+            and self.allow_fixed_shape_padding
+            and original_seq_len < self.fixed_seq_len
+        ):
+            input_ids, audio_mask, attention_mask = self._pad_inputs_to_fixed_seq_len(
+                input_ids=input_ids,
+                audio_mask=audio_mask,
+                attention_mask=attention_mask,
+            )
+
+        if valid_lengths is None:
+            valid_lengths = attention_mask[:, 0].any(dim=-1).sum(dim=-1).to(torch.int32)
+
+        model_inputs = {
+            "input_ids": np.ascontiguousarray(
+                input_ids.numpy().astype(np.int32, copy=False)
+            ),
+            "audio_mask": np.ascontiguousarray(
+                audio_mask.numpy().astype(np.int32, copy=False)
+            ),
+        }
+        if self.mask_mode == "valid_lengths":
+            model_inputs["valid_lengths"] = np.ascontiguousarray(
+                valid_lengths.numpy().astype(np.int32, copy=False)
+            )
+        else:
+            model_inputs["attention_mask"] = np.ascontiguousarray(
+                attention_mask.numpy().astype(np.int32, copy=False)
+            )
+        outputs = self.model.predict(model_inputs)
         audio_logits = np.asarray(outputs[self.output_name])
-        return torch.from_numpy(audio_logits.astype(np.float32, copy=False))
+        result = torch.from_numpy(audio_logits.astype(np.float32, copy=False))
+        if result.shape[2] != original_seq_len:
+            result = result[:, :, :original_seq_len, :]
+        return result
 
 
 @dataclass
@@ -173,6 +238,7 @@ class CoreMLBackboneRouter:
     paths: list[str]
     sessions: list[CoreMLBackboneSession]
     compute_units: str
+    allow_fixed_shape_padding: bool
     last_selected_path: str | None = None
     last_selected_fixed_seq_len: int | None = None
     last_selected_compute_units: str | None = None
@@ -182,6 +248,7 @@ class CoreMLBackboneRouter:
         cls,
         model_paths: str | list[str],
         compute_units: ComputeUnitsPreference = "all",
+        allow_fixed_shape_padding: bool = False,
     ) -> "CoreMLBackboneRouter":
         paths = _normalize_coreml_paths(model_paths)
         sessions: list[CoreMLBackboneSession] = []
@@ -189,7 +256,11 @@ class CoreMLBackboneRouter:
         for path in paths:
             try:
                 sessions.append(
-                    CoreMLBackboneSession.create(path, compute_units=compute_units)
+                    CoreMLBackboneSession.create(
+                        path,
+                        compute_units=compute_units,
+                        allow_fixed_shape_padding=allow_fixed_shape_padding,
+                    )
                 )
             except Exception as exc:
                 load_errors.append(f"{path}: {exc}")
@@ -211,7 +282,12 @@ class CoreMLBackboneRouter:
                 session.path,
             )
         )
-        return cls(paths=paths, sessions=sessions, compute_units=compute_units)
+        return cls(
+            paths=paths,
+            sessions=sessions,
+            compute_units=compute_units,
+            allow_fixed_shape_padding=allow_fixed_shape_padding,
+        )
 
     def describe_sessions(self) -> list[dict[str, Any]]:
         return [
@@ -222,6 +298,8 @@ class CoreMLBackboneRouter:
                 "fixed_seq_len": session.fixed_seq_len,
                 "max_seq_len": session.max_seq_len,
                 "dynamic_seq": session.dynamic_seq,
+                "allow_fixed_shape_padding": session.allow_fixed_shape_padding,
+                "mask_mode": session.mask_mode,
             }
             for session in self.sessions
         ]
@@ -249,6 +327,7 @@ class CoreMLBackboneRouter:
         input_ids: torch.Tensor,
         audio_mask: torch.Tensor,
         attention_mask: torch.Tensor,
+        valid_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size = int(input_ids.shape[0])
         seq_len = int(input_ids.shape[-1])
@@ -271,6 +350,7 @@ class CoreMLBackboneRouter:
             input_ids=input_ids,
             audio_mask=audio_mask,
             attention_mask=attention_mask,
+            valid_lengths=valid_lengths,
         )
 
 
