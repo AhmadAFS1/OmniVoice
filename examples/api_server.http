@@ -1,0 +1,119 @@
+### OmniVoice API requests
+### Works best with JetBrains HTTP Client or VS Code REST Client.
+### Start the server first:
+### .venv/bin/python -m omnivoice.cli.api_server --model k2-fsa/OmniVoice --ip 0.0.0.0 --port 8002
+
+@host = http://127.0.0.1:8002
+@ref_audio_path = ./ref.wav
+
+### Health
+GET {{host}}/health
+Accept: application/json
+
+###
+
+### Languages
+GET {{host}}/languages
+Accept: application/json
+
+###
+
+### Auto mode
+POST {{host}}/generate
+Content-Type: multipart/form-data; boundary=OmniVoiceBoundary
+
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="mode"
+
+auto
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="text"
+
+Hello from the OmniVoice API.
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="num_step"
+
+16
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="guidance_scale"
+
+2.0
+--OmniVoiceBoundary--
+
+###
+
+### Design mode
+POST {{host}}/generate
+Content-Type: multipart/form-data; boundary=OmniVoiceBoundary
+
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="mode"
+
+design
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="text"
+
+This voice was designed through the API request file.
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="instruct"
+
+female, low pitch, british accent
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="num_step"
+
+32
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="guidance_scale"
+
+2.0
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="postprocess_output"
+
+true
+--OmniVoiceBoundary--
+
+###
+
+### Clone mode
+### Update @ref_audio_path to point at a real local WAV file before sending.
+### Many HTTP clients support `< ./file.wav` for file inclusion in multipart requests.
+POST {{host}}/generate
+Content-Type: multipart/form-data; boundary=OmniVoiceBoundary
+
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="mode"
+
+clone
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="text"
+
+This request tests zero-shot voice cloning over HTTP.
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="ref_text"
+
+This is the transcript of the reference audio.
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="num_step"
+
+32
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="guidance_scale"
+
+2.0
+--OmniVoiceBoundary
+Content-Disposition: form-data; name="ref_audio"; filename="ref.wav"
+Content-Type: audio/wav
+
+< {{ref_audio_path}}
+--OmniVoiceBoundary--
+
+###
+
+### Notes
+### Inspect these response headers after each request:
+### X-OmniVoice-Request-Id
+### X-OmniVoice-Started-At
+### X-OmniVoice-Finished-At
+### X-OmniVoice-Latency-Ms
+### X-OmniVoice-Audio-Duration-S
+### X-OmniVoice-RTF

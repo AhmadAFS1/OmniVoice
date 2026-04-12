@@ -247,6 +247,8 @@ The server includes explicit per-request timing metadata for testing.
 Every successful `/generate` response includes:
 
 - `X-OmniVoice-Request-Id`
+- `X-OmniVoice-Started-At`
+- `X-OmniVoice-Finished-At`
 - `X-OmniVoice-Latency-Ms`
 - `X-OmniVoice-Audio-Duration-S`
 - `X-OmniVoice-RTF` if audio duration is non-zero
@@ -281,7 +283,7 @@ Relevant code:
 Example log shape:
 
 ```text
-request_id=abc123 status=success mode=design latency_ms=842.11 audio_s=3.104 rtf=0.2713 text_chars=22 has_ref_audio=False language=auto device=cuda saved_path=-
+request_id=abc123 status=success mode=design started_at=2026-04-12T19:10:00Z finished_at=2026-04-12T19:10:01Z latency_ms=842.11 audio_s=3.104 rtf=0.2713 text_chars=22 has_ref_audio=False language=auto device=cuda saved_path=-
 ```
 
 ### What `RTF` Means
@@ -437,9 +439,58 @@ curl -i -X POST http://127.0.0.1:8002/generate \
 
 Look for:
 
+- `X-OmniVoice-Started-At`
+- `X-OmniVoice-Finished-At`
 - `X-OmniVoice-Latency-Ms`
 - `X-OmniVoice-Audio-Duration-S`
 - `X-OmniVoice-RTF`
+
+## HTTP Request File
+
+A ready-to-use request file lives at:
+
+- [api_server.http](/workspace/OmniVoice/examples/api_server.http:1)
+
+It includes example requests for:
+
+- `/health`
+- `/languages`
+- `mode=auto`
+- `mode=design`
+- `mode=clone`
+
+The clone example uses a local file include placeholder:
+
+```text
+< {{ref_audio_path}}
+```
+
+Before sending the clone request, update `@ref_audio_path` in the `.http` file
+to point to a real local WAV file.
+
+## Comparing 3080 vs 3090
+
+For your GPU tests, the most useful response headers are:
+
+- `X-OmniVoice-Started-At`
+- `X-OmniVoice-Finished-At`
+- `X-OmniVoice-Latency-Ms`
+- `X-OmniVoice-Audio-Duration-S`
+- `X-OmniVoice-RTF`
+
+Suggested comparison method:
+
+1. Run the same request file on the 3080 server and the 3090 server.
+2. Keep `text`, `mode`, `num_step`, `guidance_scale`, `duration`, and prompt inputs identical.
+3. Record `X-OmniVoice-Latency-Ms`.
+4. Record `X-OmniVoice-RTF`.
+5. Compare the server logs using `request_id`, `started_at`, and `finished_at`.
+
+Interpretation:
+
+- Lower `X-OmniVoice-Latency-Ms` is better for end-user response time.
+- Lower `X-OmniVoice-RTF` is better for synthesis efficiency.
+- `RTF < 1.0` means faster than real-time.
 
 ## Current Limitations
 

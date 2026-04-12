@@ -218,6 +218,10 @@ def _persist_wav_bytes(
     return output_path
 
 
+def _iso_utc_now() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
 def _call_optional_model_method(
     model: OmniVoice,
     method_name: str,
@@ -447,6 +451,7 @@ def create_app(
         ref_audio: UploadFile | None = File(None),
     ) -> Response:
         request_id = uuid4().hex[:12]
+        started_at = _iso_utc_now()
         request_started = time.perf_counter()
         cleaned_text = _normalize_optional_text(text)
         cleaned_instruct = _normalize_optional_text(instruct)
@@ -560,6 +565,8 @@ def create_app(
             headers = {
                 "Content-Disposition": 'inline; filename="omnivoice.wav"',
                 "X-OmniVoice-Request-Id": request_id,
+                "X-OmniVoice-Started-At": started_at,
+                "X-OmniVoice-Finished-At": _iso_utc_now(),
                 "X-OmniVoice-Latency-Ms": f"{latency_ms:.2f}",
                 "X-OmniVoice-Audio-Duration-S": f"{audio_duration:.3f}",
             }
@@ -575,9 +582,11 @@ def create_app(
                 headers["X-OmniVoice-Saved-Path"] = str(saved_path)
 
             logger.info(
-                "request_id=%s status=success mode=%s latency_ms=%.2f audio_s=%.3f rtf=%s text_chars=%d has_ref_audio=%s language=%s device=%s saved_path=%s",
+                "request_id=%s status=success mode=%s started_at=%s finished_at=%s latency_ms=%.2f audio_s=%.3f rtf=%s text_chars=%d has_ref_audio=%s language=%s device=%s saved_path=%s",
                 request_id,
                 mode.value,
+                started_at,
+                headers["X-OmniVoice-Finished-At"],
                 latency_ms,
                 audio_duration,
                 f"{rtf:.4f}" if rtf is not None else "n/a",
@@ -597,8 +606,9 @@ def create_app(
             raise
         except ValueError as exc:
             logger.warning(
-                "request_id=%s status=invalid_request error=%s",
+                "request_id=%s status=invalid_request started_at=%s error=%s",
                 request_id,
+                started_at,
                 exc,
             )
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -619,9 +629,11 @@ def create_app(
             if latency_ms is None:
                 final_latency_ms = (time.perf_counter() - request_started) * 1000.0
                 logger.info(
-                    "request_id=%s status=completed_without_audio mode=%s latency_ms=%.2f text_chars=%d has_ref_audio=%s language=%s device=%s",
+                    "request_id=%s status=completed_without_audio mode=%s started_at=%s finished_at=%s latency_ms=%.2f text_chars=%d has_ref_audio=%s language=%s device=%s",
                     request_id,
                     mode.value,
+                    started_at,
+                    _iso_utc_now(),
                     final_latency_ms,
                     len(cleaned_text),
                     ref_audio is not None,
