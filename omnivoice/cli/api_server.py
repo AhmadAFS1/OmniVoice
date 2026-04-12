@@ -32,7 +32,6 @@ import time
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from threading import Lock
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -43,6 +42,14 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig, __version__
+from omnivoice.serving import (
+    ClonePromptCache,
+    GenerationBatchKey,
+    GenerationBatcher,
+    GenerationBatcherConfig,
+    PendingGeneration,
+    build_clone_prompt_cache_key,
+)
 from omnivoice.utils.lang_map import LANG_NAME_TO_ID, lang_display_name
 
 logger = logging.getLogger(__name__)
@@ -159,6 +166,48 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional directory to persist a copy of each generated WAV.",
     )
+    parser.add_argument(
+        "--batch-collect-ms",
+        type=float,
+        default=10.0,
+        help="Micro-batch collection window in milliseconds.",
+    )
+    parser.add_argument(
+        "--max-batch-requests",
+        type=int,
+        default=8,
+        help="Maximum queued API requests to merge into one inference batch.",
+    )
+    parser.add_argument(
+        "--max-batch-prompts",
+        type=int,
+        default=8,
+        help="Maximum prompt units allowed in one batch.",
+    )
+    parser.add_argument(
+        "--max-batch-target-tokens",
+        type=int,
+        default=4096,
+        help="Maximum summed target tokens in one batch.",
+    )
+    parser.add_argument(
+        "--max-batch-conditioning-tokens",
+        type=int,
+        default=8192,
+        help="Maximum summed padded sequence tokens in one batch.",
+    )
+    parser.add_argument(
+        "--max-batch-padding-ratio",
+        type=float,
+        default=2.5,
+        help="Maximum allowed padding ratio for a selected batch.",
+    )
+    parser.add_argument(
+        "--clone-prompt-cache-size",
+        type=int,
+        default=256,
+        help="Maximum number of prepared clone prompts to cache in memory.",
+    )
     return parser
 
 
@@ -175,11 +224,10 @@ def _normalize_language(value: Optional[str]) -> Optional[str]:
         return None
     return stripped
 
-
-def _save_upload_to_tempfile(upload: UploadFile) -> str:
-    suffix = Path(upload.filename or "").suffix or ".wav"
+def _save_bytes_to_tempfile(data: bytes, filename: Optional[str] = None) -> str:
+    suffix = Path(filename or "").suffix or ".wav"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
-        tmp_file.write(upload.file.read())
+        tmp_file.write(data)
         return tmp_file.name
 
 
@@ -279,6 +327,13 @@ def create_app(
     onnx_decoder: Optional[str] = None,
     onnx_decoder_provider: str = "auto",
     save_dir: Optional[str] = None,
+    batch_collect_ms: float = 10.0,
+    max_batch_requests: int = 8,
+    max_batch_prompts: int = 8,
+    max_batch_target_tokens: int = 4096,
+    max_batch_conditioning_tokens: int = 8192,
+    max_batch_padding_ratio: float = 2.5,
+    clone_prompt_cache_size: int = 256,
 ) -> FastAPI:
     device = device or get_best_device()
     dtype = get_inference_dtype(device)
@@ -357,7 +412,6 @@ def create_app(
     app.state.model = model
     app.state.model_checkpoint = model_checkpoint
     app.state.device = device
-    app.state.generate_lock = Lock()
     app.state.coreml_backbone = coreml_backbone
     app.state.coreml_compute_units = coreml_compute_units if coreml_backbone else None
     app.state.coreml_backbone_allow_fixed_padding = (
@@ -377,6 +431,21 @@ def create_app(
         onnx_decoder_provider if onnx_decoder else None
     )
     app.state.save_dir = Path(save_dir).expanduser() if save_dir else None
+    app.state.batch_config = GenerationBatcherConfig(
+        collect_ms=batch_collect_ms,
+        max_batch_requests=max(1, int(max_batch_requests)),
+        max_batch_prompts=max(1, int(max_batch_prompts)),
+        max_total_target_tokens=max(1, int(max_batch_target_tokens)),
+        max_total_conditioning_tokens=max(1, int(max_batch_conditioning_tokens)),
+        max_padding_ratio=max(1.0, float(max_batch_padding_ratio)),
+    )
+    app.state.clone_prompt_cache = ClonePromptCache(
+        max_entries=max(1, int(clone_prompt_cache_size))
+    )
+    app.state.generation_batcher = GenerationBatcher(
+        model=model,
+        config=app.state.batch_config,
+    )
 
     @app.get("/health")
     def health() -> dict:
@@ -420,6 +489,8 @@ def create_app(
                 onnx_decoder_runtime, "providers", None
             ),
             "save_dir": str(app.state.save_dir) if app.state.save_dir else None,
+            "batching": app.state.generation_batcher.stats(),
+            "clone_prompt_cache": app.state.clone_prompt_cache.stats(),
         }
 
     @app.get("/languages")
@@ -465,6 +536,13 @@ def create_app(
         audio_duration = None
         latency_ms = None
         rtf = None
+        queue_wait_ms = None
+        batch_exec_ms = None
+        batch_requests = None
+        batch_prompts = None
+        batch_target_tokens = None
+        batch_max_sequence_length = None
+        lane = None
 
         if cleaned_text is None:
             raise HTTPException(status_code=400, detail="text is required.")
@@ -529,36 +607,122 @@ def create_app(
             postprocess_output=bool(postprocess_output),
         )
 
-        kwargs = {
+        task_kwargs = {
             "text": cleaned_text,
             "language": cleaned_language,
-            "generation_config": generation_config,
         }
         if cleaned_instruct is not None:
-            kwargs["instruct"] = cleaned_instruct
+            task_kwargs["instruct"] = cleaned_instruct
         if speed is not None and float(speed) != 1.0:
-            kwargs["speed"] = float(speed)
+            task_kwargs["speed"] = float(speed)
         if duration is not None:
             if float(duration) <= 0:
                 raise HTTPException(
                     status_code=400,
                     detail="duration must be greater than 0 when provided.",
                 )
-            kwargs["duration"] = float(duration)
+            task_kwargs["duration"] = float(duration)
 
-        temp_audio_path = None
         try:
             if ref_audio is not None:
-                temp_audio_path = _save_upload_to_tempfile(ref_audio)
-                kwargs["ref_audio"] = temp_audio_path
-                if cleaned_ref_text is not None:
-                    kwargs["ref_text"] = cleaned_ref_text
+                ref_audio_bytes = ref_audio.file.read()
+                cache_key = build_clone_prompt_cache_key(
+                    ref_audio_bytes,
+                    cleaned_ref_text,
+                    bool(preprocess_prompt),
+                )
 
-            with app.state.generate_lock:
-                audios = app.state.model.generate(**kwargs)
+                def _create_prompt():
+                    temp_path = _save_bytes_to_tempfile(
+                        ref_audio_bytes,
+                        ref_audio.filename,
+                    )
+                    try:
+                        return app.state.model.create_voice_clone_prompt(
+                            ref_audio=temp_path,
+                            ref_text=cleaned_ref_text,
+                            preprocess_prompt=bool(preprocess_prompt),
+                        )
+                    finally:
+                        if os.path.exists(temp_path):
+                            os.unlink(temp_path)
 
-            audio_duration = audios[0].shape[-1] / app.state.model.sampling_rate
-            wav_bytes = _audio_to_wav_bytes(audios[0], app.state.model.sampling_rate)
+                voice_clone_prompt = app.state.clone_prompt_cache.get_or_create(
+                    cache_key,
+                    _create_prompt,
+                )
+                task_kwargs["voice_clone_prompt"] = voice_clone_prompt
+
+            prepared_task = app.state.model.prepare_generation_task(
+                preprocess_prompt=bool(preprocess_prompt),
+                **task_kwargs,
+            )
+
+            estimated_sequence_lengths = [
+                app.state.model.estimate_inference_sequence_length(
+                    text=prepared_task.texts[i],
+                    num_target_tokens=prepared_task.target_lens[i],
+                    ref_text=prepared_task.ref_texts[i],
+                    ref_audio_tokens=prepared_task.ref_audio_tokens[i],
+                    lang=prepared_task.langs[i],
+                    instruct=prepared_task.instructs[i],
+                    denoise=generation_config.denoise,
+                )
+                for i in range(prepared_task.batch_size)
+            ]
+            short_idx, long_idx = prepared_task.get_indices(
+                generation_config,
+                app.state.model.audio_tokenizer.config.frame_rate,
+            )
+            if short_idx:
+                lane = "short_mixed"
+            elif prepared_task.ref_audio_tokens[0] is not None:
+                lane = "long_ref"
+            else:
+                lane = "long_no_ref"
+            assert not (
+                short_idx and long_idx
+            ), "Single request should map to one batching lane"
+
+            batch_key = GenerationBatchKey(
+                num_step=generation_config.num_step,
+                guidance_scale=generation_config.guidance_scale,
+                t_shift=generation_config.t_shift,
+                layer_penalty_factor=generation_config.layer_penalty_factor,
+                position_temperature=generation_config.position_temperature,
+                class_temperature=generation_config.class_temperature,
+                denoise=generation_config.denoise,
+                audio_chunk_duration=generation_config.audio_chunk_duration,
+                audio_chunk_threshold=generation_config.audio_chunk_threshold,
+                lane=lane,
+            )
+
+            batch_result = app.state.generation_batcher.submit(
+                PendingGeneration(
+                    request_id=request_id,
+                    mode=mode.value,
+                    created_at=time.perf_counter(),
+                    batch_key=batch_key,
+                    task=prepared_task,
+                    generation_config=generation_config,
+                    postprocess_flags=[bool(postprocess_output)] * prepared_task.batch_size,
+                    estimated_sequence_lengths=estimated_sequence_lengths,
+                )
+            )
+
+            queue_wait_ms = batch_result.queue_wait_ms
+            batch_exec_ms = batch_result.batch_exec_ms
+            batch_requests = batch_result.batch_requests
+            batch_prompts = batch_result.batch_prompts
+            batch_target_tokens = batch_result.batch_target_tokens
+            batch_max_sequence_length = batch_result.batch_max_sequence_length
+
+            audio_duration = (
+                batch_result.audios[0].shape[-1] / app.state.model.sampling_rate
+            )
+            wav_bytes = _audio_to_wav_bytes(
+                batch_result.audios[0], app.state.model.sampling_rate
+            )
             latency_ms = (time.perf_counter() - request_started) * 1000.0
             rtf = (
                 (latency_ms / 1000.0) / audio_duration
@@ -573,6 +737,14 @@ def create_app(
                 "X-OmniVoice-Finished-At": _iso_utc_now(),
                 "X-OmniVoice-Latency-Ms": f"{latency_ms:.2f}",
                 "X-OmniVoice-Audio-Duration-S": f"{audio_duration:.3f}",
+                "X-OmniVoice-Queue-Wait-Ms": f"{queue_wait_ms:.2f}",
+                "X-OmniVoice-Batch-Exec-Ms": f"{batch_exec_ms:.2f}",
+                "X-OmniVoice-Batch-Requests": str(batch_requests),
+                "X-OmniVoice-Batch-Prompts": str(batch_prompts),
+                "X-OmniVoice-Batch-Target-Tokens": str(batch_target_tokens),
+                "X-OmniVoice-Batch-Max-Sequence-Length": str(
+                    batch_max_sequence_length
+                ),
             }
             if rtf is not None:
                 headers["X-OmniVoice-RTF"] = f"{rtf:.4f}"
@@ -586,12 +758,17 @@ def create_app(
                 headers["X-OmniVoice-Saved-Path"] = str(saved_path)
 
             logger.info(
-                "request_id=%s status=success mode=%s started_at=%s finished_at=%s latency_ms=%.2f audio_s=%.3f rtf=%s text_chars=%d has_ref_audio=%s language=%s device=%s saved_path=%s",
+                "request_id=%s status=success mode=%s started_at=%s finished_at=%s latency_ms=%.2f queue_wait_ms=%.2f batch_exec_ms=%.2f batch_requests=%s batch_prompts=%s lane=%s audio_s=%.3f rtf=%s text_chars=%d has_ref_audio=%s language=%s device=%s saved_path=%s",
                 request_id,
                 mode.value,
                 started_at,
                 headers["X-OmniVoice-Finished-At"],
                 latency_ms,
+                queue_wait_ms,
+                batch_exec_ms,
+                batch_requests,
+                batch_prompts,
+                lane,
                 audio_duration,
                 f"{rtf:.4f}" if rtf is not None else "n/a",
                 len(cleaned_text),
@@ -628,8 +805,6 @@ def create_app(
         finally:
             if ref_audio is not None:
                 ref_audio.file.close()
-            if temp_audio_path and os.path.exists(temp_audio_path):
-                os.unlink(temp_audio_path)
             if latency_ms is None:
                 final_latency_ms = (time.perf_counter() - request_started) * 1000.0
                 logger.info(
@@ -644,6 +819,10 @@ def create_app(
                     cleaned_language or "auto",
                     app.state.device,
                 )
+
+    @app.on_event("shutdown")
+    def shutdown_event() -> None:
+        app.state.generation_batcher.close()
 
     return app
 
@@ -673,6 +852,13 @@ def main() -> None:
         onnx_decoder=args.onnx_decoder,
         onnx_decoder_provider=args.onnx_decoder_provider,
         save_dir=args.save_dir,
+        batch_collect_ms=args.batch_collect_ms,
+        max_batch_requests=args.max_batch_requests,
+        max_batch_prompts=args.max_batch_prompts,
+        max_batch_target_tokens=args.max_batch_target_tokens,
+        max_batch_conditioning_tokens=args.max_batch_conditioning_tokens,
+        max_batch_padding_ratio=args.max_batch_padding_ratio,
+        clone_prompt_cache_size=args.clone_prompt_cache_size,
     )
 
     uvicorn.run(

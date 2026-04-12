@@ -539,7 +539,7 @@ class OmniVoice(PreTrainedModel):
 
         self.eval()
 
-        full_task = self._preprocess_all(
+        full_task = self.prepare_generation_task(
             text=text,
             language=language,
             ref_text=ref_text,
@@ -550,35 +550,215 @@ class OmniVoice(PreTrainedModel):
             speed=speed,
             duration=duration,
         )
+        token_outputs = self.generate_tokens(full_task, generation_config=gen_config)
+        return self.decode_tokens(
+            token_outputs,
+            ref_rms=full_task.ref_rms,
+            generation_config=gen_config,
+        )
 
-        short_idx, long_idx = full_task.get_indices(
+    def prepare_generation_task(
+        self,
+        text: Union[str, list[str]],
+        language: Union[str, list[str], None] = None,
+        ref_text: Union[str, list[str], None] = None,
+        ref_audio: Union[
+            str,
+            list[str],
+            tuple[torch.Tensor, int],
+            list[tuple[torch.Tensor, int]],
+            None,
+        ] = None,
+        voice_clone_prompt: Union[
+            VoiceClonePrompt, list[VoiceClonePrompt], None
+        ] = None,
+        instruct: Union[str, list[str], None] = None,
+        preprocess_prompt: bool = True,
+        speed: Union[float, list[Optional[float]], None] = None,
+        duration: Union[float, list[Optional[float]], None] = None,
+    ) -> GenerationTask:
+        """Normalize request inputs into a reusable :class:`GenerationTask`."""
+
+        return self._preprocess_all(
+            text=text,
+            language=language,
+            ref_text=ref_text,
+            ref_audio=ref_audio,
+            voice_clone_prompt=voice_clone_prompt,
+            instruct=instruct,
+            preprocess_prompt=preprocess_prompt,
+            speed=speed,
+            duration=duration,
+        )
+
+    @torch.inference_mode()
+    def generate_tokens(
+        self,
+        task: GenerationTask,
+        generation_config: Optional[OmniVoiceGenerationConfig] = None,
+        **kwargs,
+    ) -> list[Union[torch.Tensor, List[torch.Tensor]]]:
+        """Run stage-1 generation and return audio token outputs."""
+
+        if self.audio_tokenizer is None or self.text_tokenizer is None:
+            raise RuntimeError(
+                "Model is not loaded with audio/text tokenizers. Make sure you "
+                "loaded the model with OmniVoice.from_pretrained()."
+            )
+
+        gen_config = (
+            generation_config
+            if generation_config is not None
+            else OmniVoiceGenerationConfig.from_dict(kwargs)
+        )
+
+        self.eval()
+
+        short_idx, long_idx = task.get_indices(
             gen_config, self.audio_tokenizer.config.frame_rate
         )
 
-        results = [None] * full_task.batch_size
+        results: list[Union[torch.Tensor, List[torch.Tensor], None]] = [None] * task.batch_size
 
         if short_idx:
-            short_task = full_task.slice_task(short_idx)
+            short_task = task.slice_task(short_idx)
             short_results = self._generate_iterative(short_task, gen_config)
             for idx, res in zip(short_idx, short_results):
                 results[idx] = res
 
         if long_idx:
-            long_task = full_task.slice_task(long_idx)
+            long_task = task.slice_task(long_idx)
             long_results = self._generate_chunked(long_task, gen_config)
             for idx, res in zip(long_idx, long_results):
                 results[idx] = res
 
-        generated_audios = []
-        for i in range(full_task.batch_size):
-            assert results[i] is not None, f"Result {i} was not generated"
-            generated_audios.append(
-                self._decode_and_post_process(
-                    results[i], full_task.ref_rms[i], gen_config  # type: ignore[arg-type]
-                )
+        finalized: list[Union[torch.Tensor, List[torch.Tensor]]] = []
+        for i, result in enumerate(results):
+            assert result is not None, f"Result {i} was not generated"
+            finalized.append(result)
+
+        return finalized
+
+    @torch.inference_mode()
+    def decode_tokens(
+        self,
+        tokens: list[Union[torch.Tensor, List[torch.Tensor]]],
+        ref_rms: Union[float, list[Optional[float]], None] = None,
+        generation_config: Optional[OmniVoiceGenerationConfig] = None,
+        postprocess_output: Union[bool, list[bool], None] = None,
+        **kwargs,
+    ) -> list[torch.Tensor]:
+        """Decode stage-1 token outputs into waveform tensors.
+
+        Short-form outputs with identical token lengths are decoded together to
+        reduce stage-2 serialization overhead. Chunked long-form outputs are
+        currently decoded item-by-item.
+        """
+
+        if self.audio_tokenizer is None:
+            raise RuntimeError(
+                "Audio tokenizer is not loaded. Make sure you loaded the model "
+                "with OmniVoice.from_pretrained()."
             )
 
-        return generated_audios
+        gen_config = (
+            generation_config
+            if generation_config is not None
+            else OmniVoiceGenerationConfig.from_dict(kwargs)
+        )
+
+        batch_size = len(tokens)
+        if isinstance(ref_rms, list):
+            if len(ref_rms) != batch_size:
+                raise ValueError(
+                    "ref_rms length must match the number of token outputs"
+                )
+            ref_rms_list = ref_rms
+        else:
+            ref_rms_list = [ref_rms] * batch_size
+
+        if isinstance(postprocess_output, list):
+            if len(postprocess_output) != batch_size:
+                raise ValueError(
+                    "postprocess_output length must match the number of token outputs"
+                )
+            postprocess_flags = postprocess_output
+        elif postprocess_output is None:
+            postprocess_flags = [gen_config.postprocess_output] * batch_size
+        else:
+            postprocess_flags = [postprocess_output] * batch_size
+
+        tokenizer_device = self.audio_tokenizer.device
+        results: list[Optional[torch.Tensor]] = [None] * batch_size
+        decode_groups: dict[int, list[int]] = {}
+
+        for i, token_output in enumerate(tokens):
+            if isinstance(token_output, list):
+                chunk_audios = [
+                    self.audio_tokenizer.decode(t.to(tokenizer_device).unsqueeze(0))
+                    .audio_values[0]
+                    .cpu()
+                    for t in token_output
+                ]
+                waveform = cross_fade_chunks(chunk_audios, self.sampling_rate)
+                results[i] = self._post_process_audio(
+                    waveform,
+                    postprocess_output=postprocess_flags[i],
+                    ref_rms=ref_rms_list[i],
+                )
+            else:
+                decode_groups.setdefault(token_output.size(-1), []).append(i)
+
+        for _, group_indices in decode_groups.items():
+            batch_codes = torch.stack([tokens[i] for i in group_indices]).to(tokenizer_device)
+            decoded = self.audio_tokenizer.decode(batch_codes).audio_values.cpu()
+            for batch_idx, item_idx in enumerate(group_indices):
+                results[item_idx] = self._post_process_audio(
+                    decoded[batch_idx],
+                    postprocess_output=postprocess_flags[item_idx],
+                    ref_rms=ref_rms_list[item_idx],
+                )
+
+        finalized = []
+        for i, audio in enumerate(results):
+            assert audio is not None, f"Decoded audio {i} was not produced"
+            finalized.append(audio)
+        return finalized
+
+    def estimate_inference_sequence_length(
+        self,
+        text: str,
+        num_target_tokens: int,
+        ref_text: Optional[str] = None,
+        ref_audio_tokens: Optional[torch.Tensor] = None,
+        lang: Optional[str] = None,
+        instruct: Optional[str] = None,
+        denoise: bool = True,
+    ) -> int:
+        """Estimate the padded sequence length used by iterative decoding."""
+
+        if self.text_tokenizer is None:
+            raise RuntimeError(
+                "Text tokenizer is not loaded. Make sure you loaded the model "
+                "with OmniVoice.from_pretrained()."
+            )
+
+        style_text = ""
+        if denoise and ref_audio_tokens is not None:
+            style_text += "<|denoise|>"
+        lang_str = lang if lang else "None"
+        instruct_str = instruct if instruct else "None"
+        style_text += f"<|lang_start|>{lang_str}<|lang_end|>"
+        style_text += f"<|instruct_start|>{instruct_str}<|instruct_end|>"
+
+        style_len = self.text_tokenizer(style_text, return_tensors="pt").input_ids.size(-1)
+        full_text = _combine_text(ref_text=ref_text, text=text)
+        wrapped_text = f"<|text_start|>{full_text}<|text_end|>"
+        text_len = _tokenize_with_nonverbal_tags(
+            wrapped_text, self.text_tokenizer
+        ).size(-1)
+        ref_len = ref_audio_tokens.size(-1) if ref_audio_tokens is not None else 0
+        return style_len + text_len + ref_len + num_target_tokens
 
     def create_voice_clone_prompt(
         self,
