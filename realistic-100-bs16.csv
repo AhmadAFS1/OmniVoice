@@ -1,0 +1,101 @@
+index,ok,http_status,error,local_wall_ms,request_id,latency_ms,queue_wait_ms,batch_exec_ms,batch_requests,batch_prompts,batch_target_tokens,batch_max_sequence_length,audio_duration_s,rtf,text
+1,True,200,,1481.4939349889755,b4c8c8659487,1449.49,10.24,1429.33,1,1,100,128,4.2,0.3451,This is another compact request. It is intentionally short for concurrency tests.
+2,True,200,,4097.416538745165,464ab0d90f3f,4059.85,1398.08,2631.84,16,16,1600,130,4.2,0.9666,Fast response times matter. Efficient batching should reduce total queue pressure.
+3,True,200,,4070.3743752092123,9c1d65e1cf24,4045.6,1393.1,2631.84,16,16,1600,130,4.2,0.9632,Please read these two short sentences. They are meant for batching tests.
+4,True,200,,4063.3473079651594,1ed7d6e818f4,4033.78,1380.06,2631.84,16,16,1600,130,4.2,0.9604,This is another compact request. It is intentionally short for concurrency tests.
+5,True,200,,4068.0122887715697,880ebca99392,4037.14,1382.88,2631.84,16,16,1600,130,4.2,0.9612,This is another compact request. It is intentionally short for concurrency tests.
+6,True,200,,4081.4639534801245,2f0d7ef7b016,4036.36,1378.82,2631.84,16,16,1600,130,4.2,0.961,We are measuring API throughput. Keep the delivery smooth and even.
+7,True,200,,4044.621000997722,f536674b3b81,4017.58,1362.73,2631.84,16,16,1600,130,4.2,0.9566,Please read these two short sentences. They are meant for batching tests.
+8,True,200,,3991.930477321148,cc89902b4327,3959.1,1304.02,2631.84,16,16,1600,130,4.2,0.9426,This benchmark uses one or two sentences. We want realistic short requests.
+9,True,200,,4003.499952144921,0bc43b8c7a37,3959.12,1302.09,2631.84,16,16,1600,130,4.2,0.9426,Please read these two short sentences. They are meant for batching tests.
+10,True,200,,3987.685000523925,9c1f425a4197,3958.05,1301.86,2631.84,16,16,1600,130,4.2,0.9424,OmniVoice is running on a GPU server. This request checks queue behavior.
+11,True,200,,3882.4170073494315,4051a981badc,3849.4,1196.03,2631.84,16,16,1600,130,4.2,0.9165,This benchmark uses one or two sentences. We want realistic short requests.
+12,True,200,,3881.3607087358832,af4b33818636,3834.1,1172.36,2631.84,16,16,1600,130,4.2,0.9129,This is a short test sentence. It should be easy to batch with others.
+13,True,200,,3862.304989248514,f5fc072bd2c8,3821.3,1164.12,2631.84,16,16,1600,130,4.2,0.9098,Please read these two short sentences. They are meant for batching tests.
+14,True,200,,3820.1603023335338,f104b5929c4c,3778.87,1119.0,2631.84,16,16,1600,130,4.2,0.8997,The weather looks nice today. Please speak this naturally and clearly.
+15,True,200,,3774.0542106330395,d36a3eb1dfbc,3737.61,1081.32,2631.84,16,16,1600,130,4.2,0.8899,This benchmark uses one or two sentences. We want realistic short requests.
+16,True,200,,3777.18111500144,c5428978c217,3737.86,1080.83,2631.84,16,16,1600,130,4.2,0.89,This benchmark uses one or two sentences. We want realistic short requests.
+17,True,200,,3777.8797298669815,51d2d8ff5a4f,3735.28,1076.62,2631.84,16,16,1600,130,4.2,0.8894,The weather looks nice today. Please speak this naturally and clearly.
+18,True,200,,6487.291596829891,c3aa4292b619,6445.85,3697.99,2673.11,16,16,1600,130,4.2,1.5347,Fast response times matter. Efficient batching should reduce total queue pressure.
+19,True,200,,6465.3389621526,05831da67879,6428.81,3687.86,2673.11,16,16,1600,130,4.2,1.5307,Please read these two short sentences. They are meant for batching tests.
+20,True,200,,6455.517152324319,4621c59ea9e5,6419.75,3672.64,2673.11,16,16,1600,130,4.2,1.5285,This benchmark uses one or two sentences. We want realistic short requests.
+21,True,200,,6449.07748606056,230e7ddeee96,6409.95,3668.35,2673.11,16,16,1600,130,4.2,1.5262,This benchmark uses one or two sentences. We want realistic short requests.
+22,True,200,,6409.433599561453,1618ab4b046f,6378.6,3643.17,2673.11,16,16,1600,130,4.2,1.5187,OmniVoice is running on a GPU server. This request checks queue behavior.
+23,True,200,,6391.160340048373,102d87306f11,6356.72,3613.2,2673.11,16,16,1600,130,4.2,1.5135,Hello there. This is a short batching benchmark request.
+24,True,200,,6359.305419959128,004a328d552d,6323.86,3587.08,2673.11,16,16,1600,130,4.2,1.5057,Please read these two short sentences. They are meant for batching tests.
+25,True,200,,6329.64127138257,c592536526fe,6297.29,3561.46,2673.11,16,16,1600,130,4.2,1.4994,This is another compact request. It is intentionally short for concurrency tests.
+26,True,200,,6338.758786208928,82a133f49b70,6301.09,3561.03,2673.11,16,16,1600,130,4.2,1.5003,The weather looks nice today. Please speak this naturally and clearly.
+27,True,200,,6312.475721351802,554f856370c3,6276.72,3538.37,2673.11,16,16,1600,130,4.2,1.4945,The server should process many users together. This request helps validate that.
+28,True,200,,6285.545953549445,7f7d433588bd,6258.39,3523.5,2673.11,16,16,1600,130,4.2,1.4901,This is a short test sentence. It should be easy to batch with others.
+29,True,200,,6293.311238288879,def32c9c75b8,6256.01,3513.18,2673.11,16,16,1600,130,4.2,1.4895,We are measuring API throughput. Keep the delivery smooth and even.
+30,True,200,,6280.323541723192,3a957e90d1aa,6244.57,3502.0,2673.11,16,16,1600,130,4.2,1.4868,Please read these two short sentences. They are meant for batching tests.
+31,True,200,,6249.622204340994,b8b141532d23,6224.95,3490.57,2673.11,16,16,1600,130,4.2,1.4821,This is another compact request. It is intentionally short for concurrency tests.
+32,True,200,,6271.050821989775,8cdc2bced3bc,6231.81,3484.86,2673.11,16,16,1600,130,4.2,1.4838,The server should process many users together. This request helps validate that.
+33,True,200,,6240.270401351154,47b9f40f1f8b,6202.53,3459.5,2673.11,16,16,1600,130,4.2,1.4768,This is another compact request. It is intentionally short for concurrency tests.
+34,True,200,,8948.96840583533,85f1bef615c4,8903.09,6173.06,2696.87,16,16,1600,130,4.2,2.1198,OmniVoice is running on a GPU server. This request checks queue behavior.
+35,True,200,,8897.308059036732,e7df618d56de,8857.35,6131.43,2696.87,16,16,1600,130,4.2,2.1089,This is a short test sentence. It should be easy to batch with others.
+36,True,200,,8887.615903280675,578bc86375c0,8850.06,6127.47,2696.87,16,16,1600,130,4.2,2.1072,Fast response times matter. Efficient batching should reduce total queue pressure.
+37,True,200,,8899.981726892292,65bbc4f1bc66,8853.11,6121.34,2696.87,16,16,1600,130,4.2,2.1079,The weather looks nice today. Please speak this naturally and clearly.
+38,True,200,,8831.393599510193,09aa74a5a3f9,8797.45,6075.44,2696.87,16,16,1600,130,4.2,2.0946,Fast response times matter. Efficient batching should reduce total queue pressure.
+39,True,200,,8829.084733501077,1b626a684017,8796.24,6074.7,2696.87,16,16,1600,130,4.2,2.0943,This is another compact request. It is intentionally short for concurrency tests.
+40,True,200,,8829.977857880294,691136cfd018,8792.0,6068.93,2696.87,16,16,1600,130,4.2,2.0933,This is another compact request. It is intentionally short for concurrency tests.
+41,True,200,,8817.76280887425,33677f6dcd05,8097.5,5374.31,2696.87,16,16,1600,130,4.2,1.928,Hello there. This is a short batching benchmark request.
+42,True,200,,8783.457300625741,38f6de4155ee,5425.57,2708.54,2696.87,16,16,1600,130,4.2,1.2918,The weather looks nice today. Please speak this naturally and clearly.
+43,True,200,,8773.900538682938,57aeea8bb8a0,5423.23,2708.21,2696.87,16,16,1600,130,4.2,1.2912,This benchmark uses one or two sentences. We want realistic short requests.
+44,True,200,,8734.84230414033,ab988dd5cfc5,5423.86,2701.32,2696.87,16,16,1600,130,4.2,1.2914,This is another compact request. It is intentionally short for concurrency tests.
+45,True,200,,8728.291825391352,b61a1e462763,5424.91,2700.05,2696.87,16,16,1600,130,4.2,1.2916,Hello there. This is a short batching benchmark request.
+46,True,200,,8726.817721500993,71285e669bb1,5430.68,2700.68,2696.87,16,16,1600,130,4.2,1.293,Hello there. This is a short batching benchmark request.
+47,True,200,,8716.846315190196,79fa2f32dd10,5423.74,2695.55,2696.87,16,16,1600,130,4.2,1.2914,This is a short test sentence. It should be easy to batch with others.
+48,True,200,,8689.737320877612,eced5791eeb1,5426.15,2697.85,2696.87,16,16,1600,130,4.2,1.2919,This is a short test sentence. It should be easy to batch with others.
+49,True,200,,8682.939659804106,d2701b167024,5424.53,2697.21,2696.87,16,16,1600,130,4.2,1.2916,The weather looks nice today. Please speak this naturally and clearly.
+50,True,200,,11377.455255016685,6ddf92da8dfc,8116.58,5402.59,2691.32,16,16,1600,130,4.2,1.9325,OmniVoice is running on a GPU server. This request checks queue behavior.
+51,True,200,,11388.791661709547,456f21bf3588,8125.0,5403.06,2691.32,16,16,1600,130,4.2,1.9345,This is a short test sentence. It should be easy to batch with others.
+52,True,200,,11339.099537581205,ec0e9cd2ef78,8120.46,5405.34,2691.32,16,16,1600,130,4.2,1.9334,The server should process many users together. This request helps validate that.
+53,True,200,,11335.522786714137,506fd993fbc0,8119.78,5402.45,2691.32,16,16,1600,130,4.2,1.9333,This is another compact request. It is intentionally short for concurrency tests.
+54,True,200,,11332.664462737739,faa69e20133c,8118.43,5401.53,2691.32,16,16,1600,130,4.2,1.933,Please read these two short sentences. They are meant for batching tests.
+55,True,200,,11222.633683122694,57f2f271a9b7,8113.57,5400.04,2691.32,16,16,1600,130,4.2,1.9318,Hello there. This is a short batching benchmark request.
+56,True,200,,11162.66281157732,1fd3f649ba7f,8102.19,5398.51,2691.32,16,16,1600,130,4.2,1.9291,This is another compact request. It is intentionally short for concurrency tests.
+57,True,200,,11135.869978927076,ef3e2da233b3,8104.84,5396.66,2691.32,16,16,1600,130,4.2,1.9297,Please read these two short sentences. They are meant for batching tests.
+58,True,200,,11134.50837880373,72e53565985a,5408.82,2695.62,2691.32,16,16,1600,130,4.2,1.2878,This benchmark uses one or two sentences. We want realistic short requests.
+59,True,200,,11054.931377060711,1545981d897c,5405.26,2695.22,2691.32,16,16,1600,130,4.2,1.287,This is another compact request. It is intentionally short for concurrency tests.
+60,True,200,,11076.050153933465,3644fccc4ee9,5411.08,2688.43,2691.32,16,16,1600,130,4.2,1.2884,This is a short test sentence. It should be easy to batch with others.
+61,True,200,,11072.57781457156,ceff66b4cf1c,5407.65,2688.84,2691.32,16,16,1600,130,4.2,1.2875,Fast response times matter. Efficient batching should reduce total queue pressure.
+62,True,200,,11061.289101839066,11b1e0188b43,5404.08,2685.46,2691.32,16,16,1600,130,4.2,1.2867,Hello there. This is a short batching benchmark request.
+63,True,200,,11057.382598519325,4989d43a2e39,5402.26,2685.87,2691.32,16,16,1600,130,4.2,1.2863,Fast response times matter. Efficient batching should reduce total queue pressure.
+64,True,200,,13812.964987009764,0fa5c352e7c2,8170.88,5383.96,2696.4,16,16,1600,130,4.2,1.9454,OmniVoice is running on a GPU server. This request checks queue behavior.
+65,True,200,,11016.596240922809,b238835db26c,5390.02,2676.11,2691.32,16,16,1600,130,4.2,1.2833,This is a short test sentence. It should be easy to batch with others.
+66,True,200,,11006.08385540545,459bfc331aed,5396.63,2676.84,2691.32,16,16,1600,130,4.2,1.2849,This is another compact request. It is intentionally short for concurrency tests.
+67,True,200,,13758.973515592515,4c53a8e17855,8175.35,5378.64,2696.4,16,16,1600,130,4.2,1.9465,We are measuring API throughput. Keep the delivery smooth and even.
+68,True,200,,13739.38684631139,8ec5529ca86a,8168.1,5380.13,2696.4,16,16,1600,130,4.2,1.9448,Fast response times matter. Efficient batching should reduce total queue pressure.
+69,True,200,,13742.934936657548,812108f4ba00,8170.94,5378.45,2696.4,16,16,1600,130,4.2,1.9455,Fast response times matter. Efficient batching should reduce total queue pressure.
+70,True,200,,13730.127786286175,1f6f76fa4a88,8174.06,5378.3,2696.4,16,16,1600,130,4.2,1.9462,Fast response times matter. Efficient batching should reduce total queue pressure.
+71,True,200,,13707.494086585939,dd09953bd4c2,8171.55,5379.33,2696.4,16,16,1600,130,4.2,1.9456,We are measuring API throughput. Keep the delivery smooth and even.
+72,True,200,,13671.153732575476,58e3bd2417ba,8169.58,5377.86,2696.4,16,16,1600,130,4.2,1.9451,Hello there. This is a short batching benchmark request.
+73,True,200,,13667.435916140676,b74fc7da868f,8170.49,5376.43,2696.4,16,16,1600,130,4.2,1.9454,The server should process many users together. This request helps validate that.
+74,True,200,,13651.6787186265,5d50b251eb76,5475.96,2686.73,2696.4,16,16,1600,130,4.2,1.3038,This is another compact request. It is intentionally short for concurrency tests.
+75,True,200,,13655.156135559082,26637113bd52,5480.31,2687.12,2696.4,16,16,1600,130,4.2,1.3048,The server should process many users together. This request helps validate that.
+76,True,200,,13655.01703042537,f3dd3b3d1471,5488.9,2693.92,2696.4,16,16,1600,130,4.2,1.3069,Hello there. This is a short batching benchmark request.
+77,True,200,,13636.659607291222,0bda23f25bc6,5473.67,2687.35,2696.4,16,16,1600,130,4.2,1.3033,Fast response times matter. Efficient batching should reduce total queue pressure.
+78,True,200,,13629.1019693017,2067d29be427,5486.53,2686.49,2696.4,16,16,1600,130,4.2,1.3063,The server should process many users together. This request helps validate that.
+79,True,200,,16301.553189754486,2f33be5002bc,8170.26,5448.39,2687.66,16,16,1600,130,4.2,1.9453,Fast response times matter. Efficient batching should reduce total queue pressure.
+80,True,200,,16268.990444019437,2242e523daac,8169.69,5447.37,2687.66,16,16,1600,130,4.2,1.9452,Please read these two short sentences. They are meant for batching tests.
+81,True,200,,16259.545606561005,f6b68b6d86d6,8173.34,5447.51,2687.66,16,16,1600,130,4.2,1.946,Fast response times matter. Efficient batching should reduce total queue pressure.
+82,True,200,,13517.003803513944,3eddd5af907b,5466.92,2673.89,2696.4,16,16,1600,130,4.2,1.3016,This is another compact request. It is intentionally short for concurrency tests.
+83,True,200,,13472.863013856113,fcb1f5d064d1,5460.5,2672.81,2696.4,16,16,1600,130,4.2,1.3001,OmniVoice is running on a GPU server. This request checks queue behavior.
+84,True,200,,16158.39801542461,34e222066f36,8168.51,5446.55,2687.66,16,16,1600,130,4.2,1.9449,OmniVoice is running on a GPU server. This request checks queue behavior.
+85,True,200,,13338.097378611565,0d4f1f04af74,5464.43,2676.21,2696.4,16,16,1600,130,4.2,1.3011,The weather looks nice today. Please speak this naturally and clearly.
+86,True,200,,15994.959806092083,7f90d194e1ae,8156.45,5446.07,2687.66,16,16,1600,130,4.2,1.942,We are measuring API throughput. Keep the delivery smooth and even.
+87,True,200,,15986.114391125739,63ddedcad3ab,8164.92,5443.47,2687.66,16,16,1600,130,4.2,1.944,Hello there. This is a short batching benchmark request.
+88,True,200,,15976.962986402214,c2294b73b679,8157.59,5440.83,2687.66,16,16,1600,130,4.2,1.9423,We are measuring API throughput. Keep the delivery smooth and even.
+89,True,200,,15958.110493607819,e98192a1a762,8152.41,5440.2,2687.66,16,16,1600,130,4.2,1.9411,Please read these two short sentences. They are meant for batching tests.
+90,True,200,,15924.223890528083,b12f0d5f1c37,5488.39,2777.39,2687.66,16,16,1600,130,4.2,1.3068,The weather looks nice today. Please speak this naturally and clearly.
+91,True,200,,15922.87936154753,1502d0b03f1f,5475.86,2762.65,2687.66,16,16,1600,130,4.2,1.3038,This is a short test sentence. It should be easy to batch with others.
+92,True,200,,15929.774982854724,df414213d77e,5470.95,2749.81,2687.66,16,16,1600,130,4.2,1.3026,The server should process many users together. This request helps validate that.
+93,True,200,,15894.95374634862,006fc83ae4be,5457.98,2747.89,2687.66,16,16,1600,130,4.2,1.2995,Fast response times matter. Efficient batching should reduce total queue pressure.
+94,True,200,,15869.899136014283,6df0b8f151a5,5463.02,2749.59,2687.66,16,16,1600,130,4.2,1.3007,OmniVoice is running on a GPU server. This request checks queue behavior.
+95,True,200,,15877.415381371975,55b76758694b,5470.3,2751.36,2687.66,16,16,1600,130,4.2,1.3025,Hello there. This is a short batching benchmark request.
+96,True,200,,15840.992104262114,a906392735e7,5458.71,2750.05,2687.66,16,16,1600,130,4.2,1.2997,Fast response times matter. Efficient batching should reduce total queue pressure.
+97,True,200,,16475.333949550986,14ac103af623,6085.18,5445.13,632.4,3,3,300,128,4.2,1.4489,We are measuring API throughput. Keep the delivery smooth and even.
+98,True,200,,15854.255920276046,b95f73a1f88f,5455.61,2735.59,2687.66,16,16,1600,130,4.2,1.299,This benchmark uses one or two sentences. We want realistic short requests.
+99,True,200,,16433.212853968143,3e1d64600f69,6088.86,5447.17,632.4,3,3,300,128,4.2,1.4497,Please read these two short sentences. They are meant for batching tests.
+100,True,200,,16421.990503557026,dcb2898ac496,6084.55,5445.42,632.4,3,3,300,128,4.2,1.4487,This is another compact request. It is intentionally short for concurrency tests.

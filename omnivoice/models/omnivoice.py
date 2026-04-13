@@ -760,6 +760,79 @@ class OmniVoice(PreTrainedModel):
         ref_len = ref_audio_tokens.size(-1) if ref_audio_tokens is not None else 0
         return style_len + text_len + ref_len + num_target_tokens
 
+    def estimate_generation_batch_memory_bytes(
+        self,
+        sequence_lengths: list[int],
+        target_lengths: list[int],
+        guidance_scale: float,
+    ) -> int:
+        """Estimate incremental GPU memory needed for one iterative batch.
+
+        This is an intentionally conservative heuristic used by the online
+        batcher. It focuses on the tensors whose size grows directly with
+        batch size and padded sequence length so larger-VRAM GPUs can safely
+        admit bigger merged batches than smaller cards.
+        """
+
+        if len(sequence_lengths) != len(target_lengths):
+            raise ValueError(
+                "sequence_lengths and target_lengths must have the same length"
+            )
+        if not sequence_lengths:
+            return 0
+
+        batch_size = len(sequence_lengths)
+        effective_batch = 2 * batch_size if guidance_scale != 0 else batch_size
+        max_sequence_length = max(sequence_lengths)
+        max_target_length = max(target_lengths)
+        num_codebooks = self.config.num_audio_codebook
+        vocab_size = self.config.audio_vocab_size
+        hidden_size = getattr(self.config.llm_config, "hidden_size", 2048)
+
+        int64_bytes = 8
+        bool_bytes = 1
+        fp16_bytes = 2
+        fp32_bytes = 4
+
+        input_ids_bytes = (
+            effective_batch * num_codebooks * max_sequence_length * int64_bytes
+        )
+        audio_mask_bytes = effective_batch * max_sequence_length * bool_bytes
+        attention_mask_bytes = (
+            effective_batch
+            * max_sequence_length
+            * max_sequence_length
+            * bool_bytes
+        )
+        tokens_bytes = batch_size * num_codebooks * max_target_length * int64_bytes
+        logits_bytes = (
+            effective_batch
+            * num_codebooks
+            * max_sequence_length
+            * vocab_size
+            * fp32_bytes
+        )
+        hidden_bytes = (
+            effective_batch * max_sequence_length * hidden_size * fp16_bytes
+        )
+        scoring_bytes = (
+            batch_size * num_codebooks * max_target_length * fp32_bytes
+        )
+
+        raw_estimate = (
+            input_ids_bytes
+            + audio_mask_bytes
+            + attention_mask_bytes
+            + tokens_bytes
+            + logits_bytes
+            + hidden_bytes
+            + scoring_bytes
+        )
+
+        # Account for allocator fragmentation and transient model-side scratch
+        # tensors that are not captured by the simple shape-based estimate.
+        return int(raw_estimate * 2.5)
+
     def create_voice_clone_prompt(
         self,
         ref_audio: Union[str, tuple[torch.Tensor, int]],

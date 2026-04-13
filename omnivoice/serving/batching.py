@@ -42,11 +42,14 @@ class GenerationBatcherConfig:
     """Tuning knobs for online API micro-batching."""
 
     collect_ms: float = 10.0
-    max_batch_requests: int = 8
-    max_batch_prompts: int = 8
+    max_batch_requests: int = 32
+    max_batch_prompts: int = 32
     max_total_target_tokens: int = 4096
     max_total_conditioning_tokens: int = 8192
     max_padding_ratio: float = 2.5
+    gpu_memory_utilization: float = 0.85
+    gpu_memory_reserve_mb: int = 1024
+    max_estimated_batch_memory_mb: Optional[int] = None
 
 
 @dataclass
@@ -58,6 +61,7 @@ class PendingGenerationResult:
     batch_prompts: int
     batch_target_tokens: int
     batch_max_sequence_length: int
+    estimated_batch_memory_mb: Optional[float]
     queue_wait_ms: float
     batch_exec_ms: float
 
@@ -235,6 +239,7 @@ class GenerationBatcher:
         self._jobs_completed = 0
         self._jobs_failed = 0
         self._last_batch_summary: Optional[dict] = None
+        self._cuda_device = self._resolve_cuda_device()
         self._worker = Thread(target=self._run_loop, name=name, daemon=True)
         self._worker.start()
 
@@ -259,6 +264,8 @@ class GenerationBatcher:
             jobs_failed = self._jobs_failed
         with self._condition:
             pending = len(self._pending)
+        current_budget = self._current_memory_budget_bytes()
+        current_free = self._current_free_memory_bytes()
         return {
             "collect_ms": self._config.collect_ms,
             "max_batch_requests": self._config.max_batch_requests,
@@ -266,6 +273,19 @@ class GenerationBatcher:
             "max_total_target_tokens": self._config.max_total_target_tokens,
             "max_total_conditioning_tokens": self._config.max_total_conditioning_tokens,
             "max_padding_ratio": self._config.max_padding_ratio,
+            "gpu_memory_utilization": self._config.gpu_memory_utilization,
+            "gpu_memory_reserve_mb": self._config.gpu_memory_reserve_mb,
+            "max_estimated_batch_memory_mb": self._config.max_estimated_batch_memory_mb,
+            "current_free_memory_mb": (
+                round(current_free / (1024 * 1024), 2)
+                if current_free is not None
+                else None
+            ),
+            "current_batch_memory_budget_mb": (
+                round(current_budget / (1024 * 1024), 2)
+                if current_budget is not None
+                else None
+            ),
             "pending_jobs": pending,
             "batches_started": batches_started,
             "batches_completed": batches_completed,
@@ -273,6 +293,38 @@ class GenerationBatcher:
             "jobs_failed": jobs_failed,
             "last_batch_summary": last_summary,
         }
+
+    def _resolve_cuda_device(self) -> Optional[torch.device]:
+        try:
+            device = torch.device(self._model.device)
+        except Exception:
+            return None
+        if device.type != "cuda" or not torch.cuda.is_available():
+            return None
+        return device
+
+    def _current_free_memory_bytes(self) -> Optional[int]:
+        if self._cuda_device is None:
+            return None
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info(self._cuda_device)
+        except Exception:
+            logger.exception("Failed to query CUDA free memory")
+            return None
+        return int(free_bytes)
+
+    def _current_memory_budget_bytes(self) -> Optional[int]:
+        if self._config.max_estimated_batch_memory_mb is not None:
+            return max(0, int(self._config.max_estimated_batch_memory_mb)) * 1024 * 1024
+
+        free_bytes = self._current_free_memory_bytes()
+        if free_bytes is None:
+            return None
+
+        reserve_bytes = max(0, int(self._config.gpu_memory_reserve_mb)) * 1024 * 1024
+        usable_free = max(0, free_bytes - reserve_bytes)
+        utilization = min(max(float(self._config.gpu_memory_utilization), 0.05), 1.0)
+        return int(usable_free * utilization)
 
     def _run_loop(self) -> None:
         while True:
@@ -297,12 +349,20 @@ class GenerationBatcher:
 
     def _select_batch_locked(self) -> list[PendingGeneration]:
         anchor = self._pending[0]
+        memory_budget_bytes = self._current_memory_budget_bytes()
         selected_indices = [0]
         batch_requests = 1
         batch_prompts = anchor.prompt_count
         target_tokens = anchor.target_token_count
         conditioning_tokens = anchor.conditioning_token_count
         max_sequence_length = anchor.max_sequence_length
+        sequence_lengths = list(anchor.estimated_sequence_lengths)
+        target_lengths = list(anchor.task.target_lens)
+        estimated_batch_memory_bytes = self._model.estimate_generation_batch_memory_bytes(
+            sequence_lengths,
+            target_lengths,
+            anchor.generation_config.guidance_scale,
+        )
 
         for index in range(1, len(self._pending)):
             candidate = self._pending[index]
@@ -321,6 +381,15 @@ class GenerationBatcher:
                 if next_conditioning_tokens > 0
                 else 1.0
             )
+            next_sequence_lengths = sequence_lengths + candidate.estimated_sequence_lengths
+            next_target_lengths = target_lengths + candidate.task.target_lens
+            next_estimated_batch_memory_bytes = (
+                self._model.estimate_generation_batch_memory_bytes(
+                    next_sequence_lengths,
+                    next_target_lengths,
+                    anchor.generation_config.guidance_scale,
+                )
+            )
 
             if next_requests > self._config.max_batch_requests:
                 continue
@@ -332,6 +401,11 @@ class GenerationBatcher:
                 continue
             if padding_ratio > self._config.max_padding_ratio:
                 continue
+            if (
+                memory_budget_bytes is not None
+                and next_estimated_batch_memory_bytes > memory_budget_bytes
+            ):
+                continue
 
             selected_indices.append(index)
             batch_requests = next_requests
@@ -339,6 +413,9 @@ class GenerationBatcher:
             target_tokens = next_target_tokens
             conditioning_tokens = next_conditioning_tokens
             max_sequence_length = next_max_sequence
+            sequence_lengths = next_sequence_lengths
+            target_lengths = next_target_lengths
+            estimated_batch_memory_bytes = next_estimated_batch_memory_bytes
 
             if batch_requests >= self._config.max_batch_requests:
                 break
@@ -382,6 +459,18 @@ class GenerationBatcher:
                 ),
                 default=0,
             )
+            estimated_batch_memory_mb = (
+                self._model.estimate_generation_batch_memory_bytes(
+                    [
+                        seq_len
+                        for job in jobs
+                        for seq_len in job.estimated_sequence_lengths
+                    ],
+                    merged_task.target_lens,
+                    jobs[0].generation_config.guidance_scale,
+                )
+                / (1024 * 1024)
+            )
 
             offset = 0
             for job in jobs:
@@ -396,6 +485,7 @@ class GenerationBatcher:
                         batch_prompts=batch_prompts,
                         batch_target_tokens=batch_target_tokens,
                         batch_max_sequence_length=batch_max_sequence_length,
+                        estimated_batch_memory_mb=estimated_batch_memory_mb,
                         queue_wait_ms=queue_wait_ms,
                         batch_exec_ms=batch_exec_ms,
                     )
@@ -409,18 +499,20 @@ class GenerationBatcher:
                     "batch_prompts": batch_prompts,
                     "batch_target_tokens": batch_target_tokens,
                     "batch_max_sequence_length": batch_max_sequence_length,
+                    "estimated_batch_memory_mb": round(estimated_batch_memory_mb, 2),
                     "batch_exec_ms": round(batch_exec_ms, 2),
                     "lane": jobs[0].batch_key.lane,
                 }
 
             logger.info(
-                "batch status=success requests=%d prompts=%d lane=%s exec_ms=%.2f target_tokens=%d max_sequence_length=%d",
+                "batch status=success requests=%d prompts=%d lane=%s exec_ms=%.2f target_tokens=%d max_sequence_length=%d est_mem_mb=%.2f",
                 batch_requests,
                 batch_prompts,
                 jobs[0].batch_key.lane,
                 batch_exec_ms,
                 batch_target_tokens,
                 batch_max_sequence_length,
+                estimated_batch_memory_mb,
             )
         except Exception as exc:
             with self._stats_lock:

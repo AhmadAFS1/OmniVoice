@@ -175,13 +175,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-batch-requests",
         type=int,
-        default=8,
+        default=32,
         help="Maximum queued API requests to merge into one inference batch.",
     )
     parser.add_argument(
         "--max-batch-prompts",
         type=int,
-        default=8,
+        default=32,
         help="Maximum prompt units allowed in one batch.",
     )
     parser.add_argument(
@@ -207,6 +207,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=256,
         help="Maximum number of prepared clone prompts to cache in memory.",
+    )
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.85,
+        help="Fraction of currently free CUDA memory the batcher may target for one merged batch.",
+    )
+    parser.add_argument(
+        "--gpu-memory-reserve-mb",
+        type=int,
+        default=1024,
+        help="CUDA memory to keep in reserve for allocator overhead and runtime jitter.",
+    )
+    parser.add_argument(
+        "--max-estimated-batch-memory-mb",
+        type=int,
+        default=None,
+        help="Optional hard cap for estimated incremental batch memory. Overrides automatic CUDA-based budgeting when set.",
     )
     return parser
 
@@ -328,12 +346,15 @@ def create_app(
     onnx_decoder_provider: str = "auto",
     save_dir: Optional[str] = None,
     batch_collect_ms: float = 10.0,
-    max_batch_requests: int = 8,
-    max_batch_prompts: int = 8,
+    max_batch_requests: int = 32,
+    max_batch_prompts: int = 32,
     max_batch_target_tokens: int = 4096,
     max_batch_conditioning_tokens: int = 8192,
     max_batch_padding_ratio: float = 2.5,
     clone_prompt_cache_size: int = 256,
+    gpu_memory_utilization: float = 0.85,
+    gpu_memory_reserve_mb: int = 1024,
+    max_estimated_batch_memory_mb: Optional[int] = None,
 ) -> FastAPI:
     device = device or get_best_device()
     dtype = get_inference_dtype(device)
@@ -438,6 +459,13 @@ def create_app(
         max_total_target_tokens=max(1, int(max_batch_target_tokens)),
         max_total_conditioning_tokens=max(1, int(max_batch_conditioning_tokens)),
         max_padding_ratio=max(1.0, float(max_batch_padding_ratio)),
+        gpu_memory_utilization=min(max(float(gpu_memory_utilization), 0.05), 1.0),
+        gpu_memory_reserve_mb=max(0, int(gpu_memory_reserve_mb)),
+        max_estimated_batch_memory_mb=(
+            max(1, int(max_estimated_batch_memory_mb))
+            if max_estimated_batch_memory_mb is not None
+            else None
+        ),
     )
     app.state.clone_prompt_cache = ClonePromptCache(
         max_entries=max(1, int(clone_prompt_cache_size))
@@ -445,6 +473,19 @@ def create_app(
     app.state.generation_batcher = GenerationBatcher(
         model=model,
         config=app.state.batch_config,
+    )
+    batcher_stats = app.state.generation_batcher.stats()
+    logger.info(
+        "Batching configured: collect_ms=%.1f max_batch_requests=%d max_batch_prompts=%d target_tokens=%d conditioning_tokens=%d padding_ratio=%.2f est_batch_budget_mb=%s gpu_memory_utilization=%.2f reserve_mb=%d",
+        app.state.batch_config.collect_ms,
+        app.state.batch_config.max_batch_requests,
+        app.state.batch_config.max_batch_prompts,
+        app.state.batch_config.max_total_target_tokens,
+        app.state.batch_config.max_total_conditioning_tokens,
+        app.state.batch_config.max_padding_ratio,
+        batcher_stats.get("current_batch_memory_budget_mb"),
+        app.state.batch_config.gpu_memory_utilization,
+        app.state.batch_config.gpu_memory_reserve_mb,
     )
 
     @app.get("/health")
@@ -542,6 +583,7 @@ def create_app(
         batch_prompts = None
         batch_target_tokens = None
         batch_max_sequence_length = None
+        estimated_batch_memory_mb = None
         lane = None
 
         if cleaned_text is None:
@@ -716,6 +758,7 @@ def create_app(
             batch_prompts = batch_result.batch_prompts
             batch_target_tokens = batch_result.batch_target_tokens
             batch_max_sequence_length = batch_result.batch_max_sequence_length
+            estimated_batch_memory_mb = batch_result.estimated_batch_memory_mb
 
             audio_duration = (
                 batch_result.audios[0].shape[-1] / app.state.model.sampling_rate
@@ -746,6 +789,10 @@ def create_app(
                     batch_max_sequence_length
                 ),
             }
+            if estimated_batch_memory_mb is not None:
+                headers["X-OmniVoice-Batch-Estimated-Memory-Mb"] = (
+                    f"{estimated_batch_memory_mb:.2f}"
+                )
             if rtf is not None:
                 headers["X-OmniVoice-RTF"] = f"{rtf:.4f}"
             if app.state.save_dir is not None:
@@ -758,7 +805,7 @@ def create_app(
                 headers["X-OmniVoice-Saved-Path"] = str(saved_path)
 
             logger.info(
-                "request_id=%s status=success mode=%s started_at=%s finished_at=%s latency_ms=%.2f queue_wait_ms=%.2f batch_exec_ms=%.2f batch_requests=%s batch_prompts=%s lane=%s audio_s=%.3f rtf=%s text_chars=%d has_ref_audio=%s language=%s device=%s saved_path=%s",
+                "request_id=%s status=success mode=%s started_at=%s finished_at=%s latency_ms=%.2f queue_wait_ms=%.2f batch_exec_ms=%.2f batch_requests=%s batch_prompts=%s batch_est_mem_mb=%s lane=%s audio_s=%.3f rtf=%s text_chars=%d has_ref_audio=%s language=%s device=%s saved_path=%s",
                 request_id,
                 mode.value,
                 started_at,
@@ -768,6 +815,9 @@ def create_app(
                 batch_exec_ms,
                 batch_requests,
                 batch_prompts,
+                f"{estimated_batch_memory_mb:.2f}"
+                if estimated_batch_memory_mb is not None
+                else "n/a",
                 lane,
                 audio_duration,
                 f"{rtf:.4f}" if rtf is not None else "n/a",
@@ -859,6 +909,9 @@ def main() -> None:
         max_batch_conditioning_tokens=args.max_batch_conditioning_tokens,
         max_batch_padding_ratio=args.max_batch_padding_ratio,
         clone_prompt_cache_size=args.clone_prompt_cache_size,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        gpu_memory_reserve_mb=args.gpu_memory_reserve_mb,
+        max_estimated_batch_memory_mb=args.max_estimated_batch_memory_mb,
     )
 
     uvicorn.run(
