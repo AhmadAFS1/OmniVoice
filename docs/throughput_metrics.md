@@ -1,20 +1,23 @@
 # Throughput Metrics
 
 This document records the throughput and latency measurements collected during
-the API-server testing session in this chat.
+the API-server testing session in this chat, along with the most important
+serving lessons learned so far.
 
 Important scope note:
 
 - All measurements below are from `mode=design`
 - These are not voice-cloning benchmarks
-- These are single-request measurements on the current API server
-- The current server serializes inference with a global generate lock, so these
-  runs do not reflect dynamic batching or concurrent serving performance
+- Early phases below were collected on the pre-batching server
+- Later phases were collected after the API micro-batcher was implemented
+- The current server is no longer using the old global generate lock path for
+  `/generate`
 
 Relevant implementation detail:
 
-- [api_server.py](/workspace/OmniVoice/omnivoice/cli/api_server.py:355)
-- [api_server.py](/workspace/OmniVoice/omnivoice/cli/api_server.py:551)
+- [api_server.py](/workspace/OmniVoice/omnivoice/cli/api_server.py)
+- [batching.py](/workspace/OmniVoice/omnivoice/serving/batching.py)
+- [omnivoice.py](/workspace/OmniVoice/omnivoice/models/omnivoice.py)
 
 ## Test Request
 
@@ -36,14 +39,21 @@ postprocess_output=false
 
 ## High-Level Findings
 
-- The current API server is effectively one-request-at-a-time.
-- The shell loops used in testing were sequential.
-- The server itself also serializes `model.generate(...)` with a lock.
-- In the 20-run fixed-duration benchmark, RTX 3080 and RTX 3090 were nearly tied.
-- Under this current single-request path, the 3090 does not clearly separate
-  from the 3080.
-- This likely means the current benchmark is not saturating the GPU strongly
-  enough to expose the 3090's larger headroom.
+- In the historical single-request baseline, RTX 3080 and RTX 3090 were nearly
+  tied for this workload shape.
+- After online API micro-batching was added, throughput improved materially,
+  but one GPU was still far below the offered load in the `100 requests over 2s`
+  benchmark.
+- Under realistic 100-request concurrency, the main latency contributor became
+  queue wait rather than one-request inference time.
+- Increasing batch size from `8` to `16` reduced queueing, but also made each
+  batch much slower. The net gain was small.
+- Making batching more VRAM-aware allowed larger merged batches, but larger
+  batches alone did not guarantee better latency or higher throughput.
+- The practical goal is not simply “maximize VRAM.” The better target is:
+  maximize throughput subject to a reasonable batch execution SLA.
+- For this workload, a single GPU is currently sustaining only about
+  `5.5-6.1 req/s`, far below an offered load of `50 req/s`.
 
 ## Phase 1: Early One-Off Runs
 
@@ -210,11 +220,186 @@ host,steps,run,latency_ms,audio_duration_s,rtf
 7d7877499228,32,20,1023.30,6.200,0.1650
 ```
 
-## Current Conclusion
+## Phase 4: First Realistic 100-Request Batch Test
 
-For the current API server implementation and current benchmark shape:
+This was the first benchmark taken after the online API micro-batcher was
+implemented.
 
-- the two GPUs are effectively tied
-- the current server path is serialized
-- batching and concurrent request scheduling are the next major optimizations
-- voice-cloning throughput still needs its own dedicated benchmark pass
+Conditions:
+
+- `requests=100`
+- `concurrency=100`
+- `launch-window-s=2`
+- `mode=design`
+- `num_step=16`
+- `guidance_scale=2.0`
+- `duration=4.0`
+- default micro-batcher behavior at the time, which effectively filled
+  `8-request` merged batches
+
+### Aggregate Summary
+
+| GPU | Total Wall Time (s) | Effective Throughput (req/s) | Mean Latency (ms) | P50 Latency (ms) | P95 Latency (ms) | Mean Queue Wait (ms) | Mean Batch Exec (ms) | Batch Histogram |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| RTX 3080 | 17.13 | 5.84 | 5582.61 | 6186.81 | 6983.61 | 4347.87 | 1224.31 | `1=>1, 3=>3, 8=>96` |
+| RTX 3090 | 18.06 | 5.54 | 5891.45 | 6547.43 | 7387.30 | 4582.09 | 1292.00 | `1=>1, 3=>3, 8=>96` |
+
+### Interpretation
+
+- Batching was clearly working.
+- Almost every request landed in a full `8-request` merged batch.
+- The dominant latency contributor was queue wait, not batch execution.
+- Offered load was about `50 req/s`, but one GPU only sustained about
+  `5.5-5.8 req/s`.
+- This means queue growth was inevitable under this load shape even with
+  batching enabled.
+
+## Phase 5: Static Batch-Size Test (`bs=16`)
+
+This test increased the request and prompt caps to `16` to see whether larger
+merged batches would turn spare VRAM into more useful throughput.
+
+Conditions:
+
+- `requests=100`
+- `concurrency=100`
+- `launch-window-s=2`
+- `mode=design`
+- `num_step=16`
+- `guidance_scale=2.0`
+- `duration=4.0`
+- `max_batch_requests=16`
+- `max_batch_prompts=16`
+
+### Aggregate Summary
+
+| GPU | Total Wall Time (s) | Effective Throughput (req/s) | Mean Latency (ms) | Mean Queue Wait (ms) | Mean Batch Exec (ms) | Batch Histogram |
+|---|---:|---:|---:|---:|---:|---|
+| RTX 3080 | 16.49 | 6.06 | 5532.00 | 3192.28 | 2321.32 | `1=>1, 3=>3, 16=>96` |
+| RTX 3090 | 18.33 | 5.45 | 6171.71 | 3540.04 | 2581.21 | `1=>1, 3=>3, 16=>96` |
+
+### Interpretation
+
+- Larger merged batches did reduce queue wait on both cards.
+- But batch execution time almost doubled compared with the `8-request` run.
+- Net outcome:
+  - small improvement on the `3080`
+  - slight regression on the `3090`
+- This showed that “bigger batch” was not automatically “better throughput.”
+
+## Phase 6: VRAM-Aware Batch Admission
+
+After the first batch-size experiments, the batcher was reworked to use an
+estimated incremental GPU memory budget instead of relying primarily on a
+small fixed request cap.
+
+Relevant implementation detail:
+
+- [batching.py](/workspace/OmniVoice/omnivoice/serving/batching.py)
+- [omnivoice.py](/workspace/OmniVoice/omnivoice/models/omnivoice.py)
+- [api_server.py](/workspace/OmniVoice/omnivoice/cli/api_server.py)
+
+What changed:
+
+- default `max_batch_requests` / `max_batch_prompts` increased to `32`
+- the server now estimates batch memory from:
+  - padded sequence length
+  - target token length
+  - CFG duplication
+  - logits / masks / scratch tensors
+- the batcher now compares the estimated batch memory to a budget derived from:
+  - current free CUDA memory
+  - `gpu_memory_utilization`
+  - `gpu_memory_reserve_mb`
+
+Tested startup command:
+
+```bash
+cd /workspace/OmniVoice
+export OMNIVOICE_LOG_LEVEL=INFO
+.venv/bin/python -m omnivoice.cli.api_server \
+  --model k2-fsa/OmniVoice \
+  --device cuda \
+  --ip 0.0.0.0 \
+  --port 8002 \
+  --no-asr \
+  --batch-collect-ms 10 \
+  --gpu-memory-utilization 0.90 \
+  --gpu-memory-reserve-mb 1024
+```
+
+### Aggregate Summary
+
+| GPU | Total Wall Time (s) | Effective Throughput (req/s) | Mean Latency (ms) | Mean Queue Wait (ms) | Mean Batch Exec (ms) | Batch Histogram |
+|---|---:|---:|---:|---:|---:|---|
+| RTX 3090 | 17.15 | 5.83 | 5746.89 | 3177.43 | 2541.29 | `1=>1, 3=>3, 16=>96` |
+| RTX 3080 | 16.41 | 6.09 | 5579.30 | 1795.55 | 3756.21 | `1=>1, 8=>16, 19=>19, 32=>64` |
+
+### Interpretation
+
+- The VRAM-aware path was active because the two GPUs no longer followed the
+  same batch pattern.
+- The `3090` stayed mostly at `16-request` merged batches.
+- The `3080` admitted batches up to `32`.
+- That did **not** mean the `3080` suddenly became a better serving card.
+- Instead:
+  - queue wait fell
+  - but batch execution time became much longer
+- Net result: only a small throughput gain and no major latency breakthrough.
+
+This is the clearest evidence so far that:
+
+- maximizing admitted VRAM is not the same as maximizing throughput
+- the next scheduler target should be “best throughput under a batch-exec SLA”
+  rather than “largest batch that fits”
+
+## Current Practical Conclusions
+
+For the current implementation and current benchmark shape:
+
+- batching is working
+- one GPU is still far below the offered load in the `100 requests over 2s`
+  scenario
+- queueing dominates latency under bursty high-concurrency load
+- larger merged batches help until batch execution time grows too much
+- the current code path is not yet efficient enough to turn the `3090`'s extra
+  VRAM into a decisive latency advantage
+- the current server still has one in-flight merged batch per process
+- optimizing for raw VRAM usage alone is the wrong target
+
+The best next-step hypotheses are:
+
+- adaptive batch sizing using both memory headroom and observed batch execution
+  time
+- possible multi-replica same-GPU serving on the `3090`
+- further stage-1 efficiency improvements
+- more stage-2 decode batching
+- separate optimization passes for voice cloning
+
+## Recommended Next Measurements
+
+To keep future experiments comparable, use the following benchmark family:
+
+```bash
+.venv/bin/python scripts/benchmark_api_batching.py \
+  --requests 100 \
+  --concurrency 100 \
+  --launch-window-s 2 \
+  --mode design \
+  --num-step 16 \
+  --guidance-scale 2.0 \
+  --duration 4.0
+```
+
+And when testing server-side changes, always record:
+
+- total wall time
+- effective throughput
+- mean / p50 / p95 latency
+- mean queue wait
+- mean batch exec
+- batch histogram
+- `/health` batching stats
+
+This document should be extended before changing multiple knobs at once so the
+serving history stays interpretable.
