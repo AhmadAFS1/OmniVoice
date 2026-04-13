@@ -353,6 +353,197 @@ This is the clearest evidence so far that:
 - the next scheduler target should be “best throughput under a batch-exec SLA”
   rather than “largest batch that fits”
 
+## Phase 7: Corrected GPU-Telemetry Benchmark
+
+After fixing a stale-server issue on the `3090`, the benchmark was rerun with
+the new GPU telemetry headers enabled on both cards.
+
+Conditions:
+
+- `requests=100`
+- `concurrency=100`
+- `launch-window-s=2`
+- `mode=design`
+- `num_step=16`
+- `guidance_scale=2.0`
+- `duration=4.0`
+- VRAM-aware batcher enabled
+- GPU telemetry headers enabled
+
+### Aggregate Summary
+
+| GPU | Total Wall Time (s) | Effective Throughput (req/s) | Mean Latency (ms) | Mean Queue Wait (ms) | Mean Batch Exec (ms) | Peak GPU Util Mean (%) | Peak GPU Mem Used Mean (MB) | Peak Torch Reserved Mean (MB) | Batch Histogram |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| RTX 3080 | 16.39 | 6.10 | 5572.49 | 1776.29 | 3759.27 | 99.32 | 6247.28 | 5966.40 | `1=>1, 8=>16, 19=>19, 32=>64` |
+| RTX 3090 | 16.92 | 5.91 | 5725.11 | 1598.74 | 4080.97 | 99.00 | 6347.00 | 6006.00 | `1=>1, 8=>16, 19=>19, 32=>64` |
+
+### Detailed 3080 Summary
+
+- Total wall time: `16.39s`
+- Effective throughput: `6.10 req/s`
+- Latency ms:
+  - mean `5572.49`
+  - p50 `5973.71`
+  - p95 `6707.69`
+  - p99 `6762.94`
+  - min `1369.50`
+  - max `6806.28`
+- Queue wait ms:
+  - mean `1776.29`
+  - p50 `1287.08`
+  - p95 `5353.93`
+  - p99 `5410.45`
+  - min `10.34`
+  - max `5453.27`
+- Batch exec ms:
+  - mean `3759.27`
+  - p50 `4680.66`
+  - p95 `4692.34`
+  - p99 `4692.34`
+  - min `1253.91`
+  - max `4692.34`
+- Batch requests:
+  - mean `25.38`
+  - p50 `32`
+  - p95 `32`
+  - p99 `32`
+  - min `1`
+  - max `32`
+- Batch target tokens:
+  - mean `2538.00`
+  - p50 `3200.00`
+  - p95 `3200.00`
+  - p99 `3200.00`
+  - min `100.00`
+  - max `3200.00`
+- Batch estimated memory mb:
+  - mean `551.69`
+  - p50 `695.86`
+  - p95 `695.86`
+  - p99 `695.86`
+  - min `21.41`
+  - max `695.86`
+- GPU utilization peak pct:
+  - mean `99.32`
+  - p50 `100.00`
+  - p95 `100.00`
+  - p99 `100.00`
+  - min `32.00`
+  - max `100.00`
+- GPU memory used peak mb:
+  - mean `6247.28`
+  - p50 `6287.00`
+  - p95 `6287.00`
+  - p99 `6287.00`
+  - min `2315.00`
+  - max `6287.00`
+- GPU allocator peak allocated mb:
+  - mean `3347.47`
+  - p50 `3713.33`
+  - p95 `3713.33`
+  - p99 `3713.33`
+  - min `2001.25`
+  - max `3713.33`
+- GPU allocator peak reserved mb:
+  - mean `5966.40`
+  - p50 `6006.00`
+  - p95 `6006.00`
+  - p99 `6006.00`
+  - min `2046.00`
+  - max `6006.00`
+
+### Detailed 3090 Summary
+
+- Total wall time: `16.92s`
+- Effective throughput: `5.91 req/s`
+- Latency ms:
+  - mean `5725.11`
+  - p50 `5771.16`
+  - p95 `6582.55`
+  - p99 `6598.63`
+  - min `695.95`
+  - max `6611.28`
+- Queue wait ms:
+  - mean `1598.74`
+  - p50 `1302.72`
+  - p95 `5194.75`
+  - p99 `5207.61`
+  - min `10.67`
+  - max `5214.81`
+- Batch exec ms:
+  - mean `4080.97`
+  - p50 `5084.73`
+  - p95 `5187.95`
+  - p99 `5187.95`
+  - min `676.55`
+  - max `5187.95`
+- Batch requests:
+  - mean `25.38`
+  - p50 `32`
+  - p95 `32`
+  - p99 `32`
+  - min `1`
+  - max `32`
+- Batch target tokens:
+  - mean `2538.00`
+  - p50 `3200.00`
+  - p95 `3200.00`
+  - p99 `3200.00`
+  - min `100.00`
+  - max `3200.00`
+- Batch estimated memory mb:
+  - mean `551.69`
+  - p50 `695.86`
+  - p95 `695.86`
+  - p99 `695.86`
+  - min `21.41`
+  - max `695.86`
+- GPU utilization peak pct:
+  - mean `99.00`
+  - p50 `100.00`
+  - p95 `100.00`
+  - p99 `100.00`
+  - min `0.00`
+  - max `100.00`
+- GPU memory used peak mb:
+  - mean `6347.00`
+  - p50 `6347.00`
+  - p95 `6347.00`
+  - p99 `6347.00`
+  - min `6347.00`
+  - max `6347.00`
+- GPU allocator peak allocated mb:
+  - mean `3347.47`
+  - p50 `3713.33`
+  - p95 `3713.33`
+  - p99 `3713.33`
+  - min `2001.25`
+  - max `3713.33`
+- GPU allocator peak reserved mb:
+  - mean `6006.00`
+  - p50 `6006.00`
+  - p95 `6006.00`
+  - p99 `6006.00`
+  - min `6006.00`
+  - max `6006.00`
+
+### Interpretation
+
+- Both cards are now showing near-100% **peak** GPU utilization during merged
+  batches.
+- Both cards are reserving roughly `6.0 GB` of CUDA allocator memory during
+  these runs.
+- This is strong evidence that the current bottleneck is **not** simply
+  “unused VRAM.”
+- Instead, the current serving path appears to be hitting compute-path and/or
+  single-in-flight-batch limits before VRAM capacity is exhausted.
+- The `3090` has much more total VRAM available, but under the current model
+  path it is not turning that extra memory into higher throughput.
+- Same-GPU multi-worker serving is still worth testing, but it should now be
+  treated as an experiment to reduce head-of-line blocking or exploit idle
+  gaps between batches, not as an automatically correct “use all the VRAM”
+  strategy.
+
 ## Current Practical Conclusions
 
 For the current implementation and current benchmark shape:
@@ -366,12 +557,15 @@ For the current implementation and current benchmark shape:
   VRAM into a decisive latency advantage
 - the current server still has one in-flight merged batch per process
 - optimizing for raw VRAM usage alone is the wrong target
+- the new telemetry strongly suggests the current workload is compute-bound
+  during batches rather than memory-capacity-bound
 
 The best next-step hypotheses are:
 
 - adaptive batch sizing using both memory headroom and observed batch execution
   time
-- possible multi-replica same-GPU serving on the `3090`
+- possible multi-replica same-GPU serving on the `3090`, but as an experiment
+  rather than the default assumption
 - further stage-1 efficiency improvements
 - more stage-2 decode batching
 - separate optimization passes for voice cloning
