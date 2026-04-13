@@ -59,8 +59,15 @@ class RequestResult:
     batch_target_tokens: int | None
     batch_max_sequence_length: int | None
     batch_estimated_memory_mb: float | None
+    worker_id: str | None
+    worker_pid: int | None
     gpu_utilization_peak_pct: float | None
+    gpu_memory_total_mb: float | None
     gpu_memory_used_peak_mb: float | None
+    gpu_memory_free_before_mb: float | None
+    gpu_memory_free_after_mb: float | None
+    gpu_allocator_allocated_mb: float | None
+    gpu_allocator_reserved_mb: float | None
     gpu_allocator_peak_allocated_mb: float | None
     gpu_allocator_peak_reserved_mb: float | None
     audio_duration_s: float | None
@@ -274,8 +281,15 @@ def run_one_request(args: argparse.Namespace, index: int, text: str) -> RequestR
             batch_target_tokens=None,
             batch_max_sequence_length=None,
             batch_estimated_memory_mb=None,
+            worker_id=None,
+            worker_pid=None,
             gpu_utilization_peak_pct=None,
+            gpu_memory_total_mb=None,
             gpu_memory_used_peak_mb=None,
+            gpu_memory_free_before_mb=None,
+            gpu_memory_free_after_mb=None,
+            gpu_allocator_allocated_mb=None,
+            gpu_allocator_reserved_mb=None,
             gpu_allocator_peak_allocated_mb=None,
             gpu_allocator_peak_reserved_mb=None,
             audio_duration_s=None,
@@ -301,8 +315,15 @@ def run_one_request(args: argparse.Namespace, index: int, text: str) -> RequestR
             batch_target_tokens=None,
             batch_max_sequence_length=None,
             batch_estimated_memory_mb=None,
+            worker_id=None,
+            worker_pid=None,
             gpu_utilization_peak_pct=None,
+            gpu_memory_total_mb=None,
             gpu_memory_used_peak_mb=None,
+            gpu_memory_free_before_mb=None,
+            gpu_memory_free_after_mb=None,
+            gpu_allocator_allocated_mb=None,
+            gpu_allocator_reserved_mb=None,
             gpu_allocator_peak_allocated_mb=None,
             gpu_allocator_peak_reserved_mb=None,
             audio_duration_s=None,
@@ -331,11 +352,26 @@ def run_one_request(args: argparse.Namespace, index: int, text: str) -> RequestR
         batch_estimated_memory_mb=_header_float(
             headers, "x-omnivoice-batch-estimated-memory-mb"
         ),
+        worker_id=headers.get("x-omnivoice-worker-id"),
+        worker_pid=_header_int(headers, "x-omnivoice-worker-pid"),
         gpu_utilization_peak_pct=_header_float(
             headers, "x-omnivoice-gpu-utilization-peak-pct"
         ),
+        gpu_memory_total_mb=_header_float(headers, "x-omnivoice-gpu-memory-total-mb"),
         gpu_memory_used_peak_mb=_header_float(
             headers, "x-omnivoice-gpu-memory-used-peak-mb"
+        ),
+        gpu_memory_free_before_mb=_header_float(
+            headers, "x-omnivoice-gpu-memory-free-before-mb"
+        ),
+        gpu_memory_free_after_mb=_header_float(
+            headers, "x-omnivoice-gpu-memory-free-after-mb"
+        ),
+        gpu_allocator_allocated_mb=_header_float(
+            headers, "x-omnivoice-gpu-allocator-allocated-mb"
+        ),
+        gpu_allocator_reserved_mb=_header_float(
+            headers, "x-omnivoice-gpu-allocator-reserved-mb"
         ),
         gpu_allocator_peak_allocated_mb=_header_float(
             headers, "x-omnivoice-gpu-allocator-peak-allocated-mb"
@@ -379,8 +415,15 @@ def write_csv(path: str, results: list[RequestResult]) -> None:
         "batch_target_tokens",
         "batch_max_sequence_length",
         "batch_estimated_memory_mb",
+        "worker_id",
+        "worker_pid",
         "gpu_utilization_peak_pct",
+        "gpu_memory_total_mb",
         "gpu_memory_used_peak_mb",
+        "gpu_memory_free_before_mb",
+        "gpu_memory_free_after_mb",
+        "gpu_allocator_allocated_mb",
+        "gpu_allocator_reserved_mb",
         "gpu_allocator_peak_allocated_mb",
         "gpu_allocator_peak_reserved_mb",
         "audio_duration_s",
@@ -460,6 +503,19 @@ def print_summary(
             )
         )
 
+    worker_hist: dict[str, int] = {}
+    for result in successes:
+        if result.worker_id:
+            worker_hist[result.worker_id] = worker_hist.get(result.worker_id, 0) + 1
+    if worker_hist:
+        print(
+            "Worker distribution: "
+            + ", ".join(
+                f"{worker_id}=>{count}"
+                for worker_id, count in sorted(worker_hist.items())
+            )
+        )
+
     emit_metric(
         "Batch requests",
         [float(r.batch_requests) for r in successes if r.batch_requests is not None],
@@ -489,11 +545,51 @@ def print_summary(
         ],
     )
     emit_metric(
+        "GPU memory total mb",
+        [
+            r.gpu_memory_total_mb
+            for r in successes
+            if r.gpu_memory_total_mb is not None
+        ],
+    )
+    emit_metric(
         "GPU memory used peak mb",
         [
             r.gpu_memory_used_peak_mb
             for r in successes
             if r.gpu_memory_used_peak_mb is not None
+        ],
+    )
+    emit_metric(
+        "GPU memory free before mb",
+        [
+            r.gpu_memory_free_before_mb
+            for r in successes
+            if r.gpu_memory_free_before_mb is not None
+        ],
+    )
+    emit_metric(
+        "GPU memory free after mb",
+        [
+            r.gpu_memory_free_after_mb
+            for r in successes
+            if r.gpu_memory_free_after_mb is not None
+        ],
+    )
+    emit_metric(
+        "GPU allocator allocated mb",
+        [
+            r.gpu_allocator_allocated_mb
+            for r in successes
+            if r.gpu_allocator_allocated_mb is not None
+        ],
+    )
+    emit_metric(
+        "GPU allocator reserved mb",
+        [
+            r.gpu_allocator_reserved_mb
+            for r in successes
+            if r.gpu_allocator_reserved_mb is not None
         ],
     )
     emit_metric(

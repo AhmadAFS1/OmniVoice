@@ -730,7 +730,8 @@ class GenerationBatcher:
                 }
 
             logger.info(
-                "batch status=success requests=%d prompts=%d lane=%s exec_ms=%.2f target_tokens=%d max_sequence_length=%d est_mem_mb=%.2f gpu_peak_util_pct=%s gpu_peak_used_mb=%s torch_peak_alloc_mb=%s torch_peak_reserved_mb=%s",
+                "[%s] batch status=success requests=%d prompts=%d lane=%s exec_ms=%.2f target_tokens=%d max_sequence_length=%d est_mem_mb=%.2f gpu_peak_util_pct=%s gpu_peak_used_mb=%s gpu_free_before_mb=%s gpu_free_after_mb=%s torch_alloc_mb=%s torch_reserved_mb=%s torch_peak_alloc_mb=%s torch_peak_reserved_mb=%s",
+                self._name,
                 batch_requests,
                 batch_prompts,
                 jobs[0].batch_key.lane,
@@ -740,6 +741,10 @@ class GenerationBatcher:
                 estimated_batch_memory_mb,
                 gpu_metrics.get("gpu_utilization_peak_pct"),
                 gpu_metrics.get("gpu_memory_used_peak_mb"),
+                gpu_metrics.get("gpu_memory_free_before_mb"),
+                gpu_metrics.get("gpu_memory_free_after_mb"),
+                gpu_metrics.get("torch_allocated_mb"),
+                gpu_metrics.get("torch_reserved_mb"),
                 gpu_metrics.get("torch_peak_allocated_mb"),
                 gpu_metrics.get("torch_peak_reserved_mb"),
             )
@@ -750,7 +755,8 @@ class GenerationBatcher:
             for job in jobs:
                 job.future.set_exception(exc)
             logger.exception(
-                "batch status=failed requests=%d lane=%s",
+                "[%s] batch status=failed requests=%d lane=%s",
+                self._name,
                 len(jobs),
                 jobs[0].batch_key.lane if jobs else "unknown",
             )

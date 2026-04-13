@@ -9,6 +9,65 @@ very large in-flight batch per process.
 
 This is an execution plan, not just a brainstorming note.
 
+## Current Implementation Status
+
+This branch now includes a first working version of the same-GPU multi-worker
+design described below.
+
+Implemented pieces:
+
+- `omnivoice/serving/service.py`
+  - extracted the request-to-audio generation path into a reusable local
+    service object
+- `omnivoice/serving/multiworker.py`
+  - added a parent router backend that starts multiple local worker processes
+    on the same CUDA device
+  - routes requests by least pending worker, with EWMA tie-breaking from recent
+    batch timings
+  - tracks per-worker pending counts, failures, and last-response metrics
+- `omnivoice/cli/api_server.py`
+  - added backend selection between direct mode and same-GPU worker mode
+  - added `--same-gpu-workers` / `--gpu-workers`
+  - added `--api-thread-limit` so the HTTP layer can actually hold large
+    concurrent bursts while requests wait on worker responses
+- `scripts/benchmark_api_batching.py`
+  - records `worker_id`, `worker_pid`, and worker VRAM headers
+  - prints a worker-distribution summary so we can confirm load is split
+
+Current worker behavior:
+
+- each worker loads its own OmniVoice model replica on the same GPU
+- each worker keeps its own existing `GenerationBatcher`
+- each worker uses a local request thread pool so concurrent requests inside a
+  worker can still merge into one inference batch
+- request and batch logs now include worker IDs, PIDs, and extra VRAM fields
+  such as free-before/free-after and allocator reserved memory
+
+Recommended first launch command:
+
+```bash
+.venv/bin/python -m omnivoice.cli.api_server \
+  --device cuda:0 \
+  --same-gpu-workers 2 \
+  --api-thread-limit 256 \
+  --batch-collect-ms 10 \
+  --max-batch-requests 12 \
+  --max-batch-prompts 12
+```
+
+Recommended first benchmark:
+
+```bash
+.venv/bin/python scripts/benchmark_api_batching.py \
+  --requests 100 \
+  --concurrency 100 \
+  --launch-window-s 2 \
+  --mode design \
+  --num-step 16 \
+  --guidance-scale 2.0 \
+  --duration 4.0
+```
+
 ## Why We Are Testing This
 
 Recent telemetry-backed benchmarks showed:
@@ -612,4 +671,3 @@ If it regresses, we will know the next effort should go into:
 - adaptive batch sizing
 - model-path efficiency
 - or a different hardware / multi-GPU strategy
-
