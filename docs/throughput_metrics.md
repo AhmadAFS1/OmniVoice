@@ -718,3 +718,145 @@ So future optimization work should optimize for:
 - lower `Local wall ms`
 - lower p50 / p95 `Local wall ms`
 - not just lower in-app `Latency ms`
+
+## Phase 9: 25-Request Practical Capacity Snapshot
+
+This benchmark is useful because it is much closer to a “possibly acceptable”
+latency regime for the current single-GPU setup than the severe overload cases.
+
+Conditions:
+
+- GPU: `RTX 3090`
+- `requests=25`
+- `concurrency=25`
+- `launch-window-s=2`
+- `mode=design`
+- `num_step=16`
+- `guidance_scale=2.0`
+- `duration=4.0`
+
+Observed benchmark summary:
+
+- Requests: `25`
+- Concurrency: `25`
+- Launch window: `2.00s`
+- Successes: `25`
+- Failures: `0`
+- Total wall time: `4.62s`
+- Effective throughput: `5.41 req/s`
+
+### Detailed Metrics
+
+- `Latency ms`
+  - mean `2092.43`
+  - p50 `2239.06`
+  - p95 `2689.61`
+  - p99 `2741.98`
+  - min `564.29`
+  - max `2754.39`
+- `Queue wait ms`
+  - mean `606.55`
+  - p50 `398.88`
+  - p95 `1896.06`
+  - p99 `1907.83`
+  - min `10.52`
+  - max `1911.53`
+- `Batch exec ms`
+  - mean `1470.36`
+  - p50 `1239.42`
+  - p95 `1959.45`
+  - p99 `1959.45`
+  - min `547.88`
+  - max `1959.45`
+- `Local wall ms`
+  - mean `2123.46`
+  - p50 `2271.15`
+  - p95 `2723.54`
+  - p99 `2773.80`
+  - min `593.94`
+  - max `2785.56`
+- `Observed batch_requests histogram`
+  - `1=>1, 4=>4, 8=>8, 12=>12`
+- `Batch requests`
+  - mean `9.00`
+  - p50 `8.00`
+  - p95 `12.00`
+  - p99 `12.00`
+  - min `1.00`
+  - max `12.00`
+- `Batch target tokens`
+  - mean `900.00`
+  - p50 `800.00`
+  - p95 `1200.00`
+  - p99 `1200.00`
+  - min `100.00`
+  - max `1200.00`
+- `Batch estimated memory mb`
+  - mean `194.84`
+  - p50 `171.28`
+  - p95 `260.95`
+  - p99 `260.95`
+  - min `21.41`
+  - max `260.95`
+- `GPU utilization peak pct`
+  - mean `97.52`
+  - p50 `100.00`
+  - p95 `100.00`
+  - p99 `100.00`
+  - min `38.00`
+  - max `100.00`
+- `GPU memory used peak mb`
+  - mean `6631.00`
+  - p50 `6631.00`
+  - p95 `6631.00`
+  - p99 `6631.00`
+  - min `6631.00`
+  - max `6631.00`
+- `GPU allocator peak allocated mb`
+  - mean `2442.57`
+  - p50 `2387.37`
+  - p95 `2608.12`
+  - p99 `2608.12`
+  - min `2001.25`
+  - max `2608.12`
+- `GPU allocator peak reserved mb`
+  - mean `6288.00`
+  - p50 `6288.00`
+  - p95 `6288.00`
+  - p99 `6288.00`
+  - min `6288.00`
+  - max `6288.00`
+
+### Interpretation
+
+This is the best current “practical capacity snapshot” for the single `RTX 3090`
+server in this repo:
+
+- around `25` requests over `2s` is currently in a much more acceptable
+  latency range
+- client-observed p50 latency is about `2.27s`
+- client-observed p95 latency is about `2.72s`
+- client-observed p99 latency is about `2.77s`
+
+So, for this exact workload shape and current implementation:
+
+- `25` requests over `2s` is roughly within the current acceptable `2-3s`
+  latency regime
+- `100` requests over `2s` is already much more stressed
+- `1000` requests over `2s` is severe overload
+
+### Operational Caution
+
+This should **not** be treated as a universal hard capacity number.
+
+It is only a practical snapshot for:
+
+- current code
+- current batcher behavior
+- current benchmark request shape
+- `mode=design`
+- `num_step=16`
+- `duration=4.0`
+
+Clone mode, longer text, higher `num_step`, different request arrival patterns,
+or additional system overhead may reduce this capacity significantly.
