@@ -58,6 +58,11 @@ class RequestResult:
     batch_prompts: int | None
     batch_target_tokens: int | None
     batch_max_sequence_length: int | None
+    batch_estimated_memory_mb: float | None
+    gpu_utilization_peak_pct: float | None
+    gpu_memory_used_peak_mb: float | None
+    gpu_allocator_peak_allocated_mb: float | None
+    gpu_allocator_peak_reserved_mb: float | None
     audio_duration_s: float | None
     rtf: float | None
     text: str
@@ -268,6 +273,11 @@ def run_one_request(args: argparse.Namespace, index: int, text: str) -> RequestR
             batch_prompts=None,
             batch_target_tokens=None,
             batch_max_sequence_length=None,
+            batch_estimated_memory_mb=None,
+            gpu_utilization_peak_pct=None,
+            gpu_memory_used_peak_mb=None,
+            gpu_allocator_peak_allocated_mb=None,
+            gpu_allocator_peak_reserved_mb=None,
             audio_duration_s=None,
             rtf=None,
             text=text,
@@ -290,6 +300,11 @@ def run_one_request(args: argparse.Namespace, index: int, text: str) -> RequestR
             batch_prompts=None,
             batch_target_tokens=None,
             batch_max_sequence_length=None,
+            batch_estimated_memory_mb=None,
+            gpu_utilization_peak_pct=None,
+            gpu_memory_used_peak_mb=None,
+            gpu_allocator_peak_allocated_mb=None,
+            gpu_allocator_peak_reserved_mb=None,
             audio_duration_s=None,
             rtf=None,
             text=text,
@@ -312,6 +327,21 @@ def run_one_request(args: argparse.Namespace, index: int, text: str) -> RequestR
         batch_target_tokens=_header_int(headers, "x-omnivoice-batch-target-tokens"),
         batch_max_sequence_length=_header_int(
             headers, "x-omnivoice-batch-max-sequence-length"
+        ),
+        batch_estimated_memory_mb=_header_float(
+            headers, "x-omnivoice-batch-estimated-memory-mb"
+        ),
+        gpu_utilization_peak_pct=_header_float(
+            headers, "x-omnivoice-gpu-utilization-peak-pct"
+        ),
+        gpu_memory_used_peak_mb=_header_float(
+            headers, "x-omnivoice-gpu-memory-used-peak-mb"
+        ),
+        gpu_allocator_peak_allocated_mb=_header_float(
+            headers, "x-omnivoice-gpu-allocator-peak-allocated-mb"
+        ),
+        gpu_allocator_peak_reserved_mb=_header_float(
+            headers, "x-omnivoice-gpu-allocator-peak-reserved-mb"
         ),
         audio_duration_s=_header_float(headers, "x-omnivoice-audio-duration-s"),
         rtf=_header_float(headers, "x-omnivoice-rtf"),
@@ -348,6 +378,11 @@ def write_csv(path: str, results: list[RequestResult]) -> None:
         "batch_prompts",
         "batch_target_tokens",
         "batch_max_sequence_length",
+        "batch_estimated_memory_mb",
+        "gpu_utilization_peak_pct",
+        "gpu_memory_used_peak_mb",
+        "gpu_allocator_peak_allocated_mb",
+        "gpu_allocator_peak_reserved_mb",
         "audio_duration_s",
         "rtf",
         "text",
@@ -435,6 +470,46 @@ def print_summary(
             float(r.batch_target_tokens)
             for r in successes
             if r.batch_target_tokens is not None
+        ],
+    )
+    emit_metric(
+        "Batch estimated memory mb",
+        [
+            r.batch_estimated_memory_mb
+            for r in successes
+            if r.batch_estimated_memory_mb is not None
+        ],
+    )
+    emit_metric(
+        "GPU utilization peak pct",
+        [
+            r.gpu_utilization_peak_pct
+            for r in successes
+            if r.gpu_utilization_peak_pct is not None
+        ],
+    )
+    emit_metric(
+        "GPU memory used peak mb",
+        [
+            r.gpu_memory_used_peak_mb
+            for r in successes
+            if r.gpu_memory_used_peak_mb is not None
+        ],
+    )
+    emit_metric(
+        "GPU allocator peak allocated mb",
+        [
+            r.gpu_allocator_peak_allocated_mb
+            for r in successes
+            if r.gpu_allocator_peak_allocated_mb is not None
+        ],
+    )
+    emit_metric(
+        "GPU allocator peak reserved mb",
+        [
+            r.gpu_allocator_peak_reserved_mb
+            for r in successes
+            if r.gpu_allocator_peak_reserved_mb is not None
         ],
     )
 

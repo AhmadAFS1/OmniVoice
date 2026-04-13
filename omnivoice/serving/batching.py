@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import shutil
+import subprocess
 import time
 from collections import OrderedDict
 from concurrent.futures import Future
@@ -62,6 +64,7 @@ class PendingGenerationResult:
     batch_target_tokens: int
     batch_max_sequence_length: int
     estimated_batch_memory_mb: Optional[float]
+    gpu_metrics: dict[str, object]
     queue_wait_ms: float
     batch_exec_ms: float
 
@@ -155,6 +158,210 @@ class ClonePromptCache:
             }
 
 
+class GpuTelemetryMonitor:
+    """Lightweight CUDA telemetry sampler for live and per-batch stats."""
+
+    def __init__(self, cuda_device: Optional[torch.device], poll_ms: float = 250.0):
+        self._cuda_device = cuda_device
+        self._poll_interval_s = max(0.05, float(poll_ms) / 1000.0)
+        self._gpu_index = None
+        self._nvidia_smi = shutil.which("nvidia-smi")
+        self._lock = Lock()
+        self._latest_snapshot: Optional[dict[str, object]] = None
+        self._batch_active = False
+        self._batch_free_before_mb: Optional[float] = None
+        self._batch_peak_utilization_pct: Optional[float] = None
+        self._batch_peak_memory_used_mb: Optional[float] = None
+        self._stopping = False
+        self._worker: Optional[Thread] = None
+
+        if self._cuda_device is not None:
+            self._gpu_index = (
+                self._cuda_device.index
+                if self._cuda_device.index is not None
+                else torch.cuda.current_device()
+            )
+            self._latest_snapshot = self._query_nvidia_smi()
+            if self._nvidia_smi is not None:
+                self._worker = Thread(
+                    target=self._run_loop,
+                    name="omnivoice-gpu-telemetry",
+                    daemon=True,
+                )
+                self._worker.start()
+
+    def close(self) -> None:
+        self._stopping = True
+        if self._worker is not None:
+            self._worker.join(timeout=2.0)
+
+    def latest_snapshot(self) -> Optional[dict[str, object]]:
+        if self._cuda_device is None:
+            return None
+
+        snapshot = None
+        with self._lock:
+            if self._latest_snapshot is not None:
+                snapshot = dict(self._latest_snapshot)
+
+        if snapshot is None:
+            snapshot = self._query_nvidia_smi()
+
+        torch_snapshot = self._torch_memory_snapshot()
+        if snapshot is None:
+            snapshot = {}
+        snapshot.update(torch_snapshot)
+        snapshot["gpu_index"] = self._gpu_index
+        return snapshot
+
+    def begin_batch(self) -> None:
+        if self._cuda_device is None:
+            return
+        try:
+            torch.cuda.synchronize(self._cuda_device)
+            torch.cuda.reset_peak_memory_stats(self._cuda_device)
+        except Exception:
+            logger.exception("Failed to reset CUDA peak memory stats")
+
+        snapshot = self.latest_snapshot()
+        with self._lock:
+            self._batch_active = True
+            self._batch_free_before_mb = (
+                float(snapshot["gpu_memory_free_mb"])
+                if snapshot and snapshot.get("gpu_memory_free_mb") is not None
+                else None
+            )
+            self._batch_peak_utilization_pct = (
+                float(snapshot["gpu_utilization_pct"])
+                if snapshot and snapshot.get("gpu_utilization_pct") is not None
+                else None
+            )
+            self._batch_peak_memory_used_mb = (
+                float(snapshot["gpu_memory_used_mb"])
+                if snapshot and snapshot.get("gpu_memory_used_mb") is not None
+                else None
+            )
+
+    def end_batch(self) -> dict[str, object]:
+        if self._cuda_device is None:
+            return {}
+
+        try:
+            torch.cuda.synchronize(self._cuda_device)
+        except Exception:
+            logger.exception("Failed to synchronize CUDA device for telemetry")
+
+        snapshot = self.latest_snapshot() or {}
+        with self._lock:
+            result = {
+                "gpu_index": self._gpu_index,
+                "gpu_name": snapshot.get("gpu_name"),
+                "gpu_utilization_pct": snapshot.get("gpu_utilization_pct"),
+                "gpu_utilization_peak_pct": self._batch_peak_utilization_pct,
+                "gpu_memory_total_mb": snapshot.get("gpu_memory_total_mb"),
+                "gpu_memory_used_mb": snapshot.get("gpu_memory_used_mb"),
+                "gpu_memory_used_peak_mb": self._batch_peak_memory_used_mb,
+                "gpu_memory_free_before_mb": self._batch_free_before_mb,
+                "gpu_memory_free_after_mb": snapshot.get("gpu_memory_free_mb"),
+                "torch_allocated_mb": snapshot.get("torch_allocated_mb"),
+                "torch_reserved_mb": snapshot.get("torch_reserved_mb"),
+                "torch_peak_allocated_mb": snapshot.get("torch_peak_allocated_mb"),
+                "torch_peak_reserved_mb": snapshot.get("torch_peak_reserved_mb"),
+            }
+            self._batch_active = False
+            self._batch_free_before_mb = None
+            self._batch_peak_utilization_pct = None
+            self._batch_peak_memory_used_mb = None
+        return result
+
+    def _run_loop(self) -> None:
+        while not self._stopping:
+            snapshot = self._query_nvidia_smi()
+            if snapshot is not None:
+                with self._lock:
+                    self._latest_snapshot = snapshot
+                    if self._batch_active:
+                        util_pct = snapshot.get("gpu_utilization_pct")
+                        used_mb = snapshot.get("gpu_memory_used_mb")
+                        if util_pct is not None:
+                            util_pct = float(util_pct)
+                            if (
+                                self._batch_peak_utilization_pct is None
+                                or util_pct > self._batch_peak_utilization_pct
+                            ):
+                                self._batch_peak_utilization_pct = util_pct
+                        if used_mb is not None:
+                            used_mb = float(used_mb)
+                            if (
+                                self._batch_peak_memory_used_mb is None
+                                or used_mb > self._batch_peak_memory_used_mb
+                            ):
+                                self._batch_peak_memory_used_mb = used_mb
+            time.sleep(self._poll_interval_s)
+
+    def _query_nvidia_smi(self) -> Optional[dict[str, object]]:
+        if self._gpu_index is None or self._nvidia_smi is None:
+            return None
+        try:
+            completed = subprocess.run(
+                [
+                    self._nvidia_smi,
+                    "--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu",
+                    "--format=csv,noheader,nounits",
+                    "-i",
+                    str(self._gpu_index),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=1.0,
+            )
+        except Exception:
+            return None
+        if completed.returncode != 0:
+            return None
+        line = completed.stdout.strip().splitlines()
+        if not line:
+            return None
+        parts = [part.strip() for part in line[0].split(",")]
+        if len(parts) != 5:
+            return None
+        try:
+            return {
+                "gpu_name": parts[0],
+                "gpu_memory_total_mb": float(parts[1]),
+                "gpu_memory_used_mb": float(parts[2]),
+                "gpu_memory_free_mb": float(parts[3]),
+                "gpu_utilization_pct": float(parts[4]),
+            }
+        except ValueError:
+            return None
+
+    def _torch_memory_snapshot(self) -> dict[str, object]:
+        if self._cuda_device is None:
+            return {}
+        try:
+            return {
+                "torch_allocated_mb": round(
+                    torch.cuda.memory_allocated(self._cuda_device) / (1024 * 1024), 2
+                ),
+                "torch_reserved_mb": round(
+                    torch.cuda.memory_reserved(self._cuda_device) / (1024 * 1024), 2
+                ),
+                "torch_peak_allocated_mb": round(
+                    torch.cuda.max_memory_allocated(self._cuda_device) / (1024 * 1024),
+                    2,
+                ),
+                "torch_peak_reserved_mb": round(
+                    torch.cuda.max_memory_reserved(self._cuda_device) / (1024 * 1024),
+                    2,
+                ),
+            }
+        except Exception:
+            logger.exception("Failed to query torch CUDA memory stats")
+            return {}
+
+
 def build_clone_prompt_cache_key(
     audio_bytes: bytes,
     ref_text: Optional[str],
@@ -240,6 +447,7 @@ class GenerationBatcher:
         self._jobs_failed = 0
         self._last_batch_summary: Optional[dict] = None
         self._cuda_device = self._resolve_cuda_device()
+        self._gpu_monitor = GpuTelemetryMonitor(self._cuda_device)
         self._worker = Thread(target=self._run_loop, name=name, daemon=True)
         self._worker.start()
 
@@ -254,6 +462,7 @@ class GenerationBatcher:
             self._stopping = True
             self._condition.notify_all()
         self._worker.join(timeout=5.0)
+        self._gpu_monitor.close()
 
     def stats(self) -> dict:
         with self._stats_lock:
@@ -292,6 +501,7 @@ class GenerationBatcher:
             "jobs_completed": jobs_completed,
             "jobs_failed": jobs_failed,
             "last_batch_summary": last_summary,
+            "gpu": self._gpu_monitor.latest_snapshot(),
         }
 
     def _resolve_cuda_device(self) -> Optional[torch.device]:
@@ -431,6 +641,7 @@ class GenerationBatcher:
         merged_postprocess_flags = [
             flag for job in jobs for flag in job.postprocess_flags
         ]
+        self._gpu_monitor.begin_batch()
 
         with self._stats_lock:
             self._batches_started += 1
@@ -471,6 +682,7 @@ class GenerationBatcher:
                 )
                 / (1024 * 1024)
             )
+            gpu_metrics = self._gpu_monitor.end_batch()
 
             offset = 0
             for job in jobs:
@@ -486,6 +698,7 @@ class GenerationBatcher:
                         batch_target_tokens=batch_target_tokens,
                         batch_max_sequence_length=batch_max_sequence_length,
                         estimated_batch_memory_mb=estimated_batch_memory_mb,
+                        gpu_metrics=dict(gpu_metrics),
                         queue_wait_ms=queue_wait_ms,
                         batch_exec_ms=batch_exec_ms,
                     )
@@ -500,12 +713,24 @@ class GenerationBatcher:
                     "batch_target_tokens": batch_target_tokens,
                     "batch_max_sequence_length": batch_max_sequence_length,
                     "estimated_batch_memory_mb": round(estimated_batch_memory_mb, 2),
+                    "gpu_utilization_peak_pct": gpu_metrics.get(
+                        "gpu_utilization_peak_pct"
+                    ),
+                    "gpu_memory_used_peak_mb": gpu_metrics.get(
+                        "gpu_memory_used_peak_mb"
+                    ),
+                    "torch_peak_allocated_mb": gpu_metrics.get(
+                        "torch_peak_allocated_mb"
+                    ),
+                    "torch_peak_reserved_mb": gpu_metrics.get(
+                        "torch_peak_reserved_mb"
+                    ),
                     "batch_exec_ms": round(batch_exec_ms, 2),
                     "lane": jobs[0].batch_key.lane,
                 }
 
             logger.info(
-                "batch status=success requests=%d prompts=%d lane=%s exec_ms=%.2f target_tokens=%d max_sequence_length=%d est_mem_mb=%.2f",
+                "batch status=success requests=%d prompts=%d lane=%s exec_ms=%.2f target_tokens=%d max_sequence_length=%d est_mem_mb=%.2f gpu_peak_util_pct=%s gpu_peak_used_mb=%s torch_peak_alloc_mb=%s torch_peak_reserved_mb=%s",
                 batch_requests,
                 batch_prompts,
                 jobs[0].batch_key.lane,
@@ -513,8 +738,13 @@ class GenerationBatcher:
                 batch_target_tokens,
                 batch_max_sequence_length,
                 estimated_batch_memory_mb,
+                gpu_metrics.get("gpu_utilization_peak_pct"),
+                gpu_metrics.get("gpu_memory_used_peak_mb"),
+                gpu_metrics.get("torch_peak_allocated_mb"),
+                gpu_metrics.get("torch_peak_reserved_mb"),
             )
         except Exception as exc:
+            self._gpu_monitor.end_batch()
             with self._stats_lock:
                 self._jobs_failed += len(jobs)
             for job in jobs:

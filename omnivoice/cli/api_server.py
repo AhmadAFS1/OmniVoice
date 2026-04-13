@@ -584,6 +584,7 @@ def create_app(
         batch_target_tokens = None
         batch_max_sequence_length = None
         estimated_batch_memory_mb = None
+        gpu_metrics: dict[str, object] = {}
         lane = None
 
         if cleaned_text is None:
@@ -759,6 +760,7 @@ def create_app(
             batch_target_tokens = batch_result.batch_target_tokens
             batch_max_sequence_length = batch_result.batch_max_sequence_length
             estimated_batch_memory_mb = batch_result.estimated_batch_memory_mb
+            gpu_metrics = batch_result.gpu_metrics
 
             audio_duration = (
                 batch_result.audios[0].shape[-1] / app.state.model.sampling_rate
@@ -793,6 +795,22 @@ def create_app(
                 headers["X-OmniVoice-Batch-Estimated-Memory-Mb"] = (
                     f"{estimated_batch_memory_mb:.2f}"
                 )
+            if gpu_metrics.get("gpu_utilization_peak_pct") is not None:
+                headers["X-OmniVoice-GPU-Utilization-Peak-Pct"] = (
+                    f"{float(gpu_metrics['gpu_utilization_peak_pct']):.2f}"
+                )
+            if gpu_metrics.get("gpu_memory_used_peak_mb") is not None:
+                headers["X-OmniVoice-GPU-Memory-Used-Peak-Mb"] = (
+                    f"{float(gpu_metrics['gpu_memory_used_peak_mb']):.2f}"
+                )
+            if gpu_metrics.get("torch_peak_allocated_mb") is not None:
+                headers["X-OmniVoice-GPU-Allocator-Peak-Allocated-Mb"] = (
+                    f"{float(gpu_metrics['torch_peak_allocated_mb']):.2f}"
+                )
+            if gpu_metrics.get("torch_peak_reserved_mb") is not None:
+                headers["X-OmniVoice-GPU-Allocator-Peak-Reserved-Mb"] = (
+                    f"{float(gpu_metrics['torch_peak_reserved_mb']):.2f}"
+                )
             if rtf is not None:
                 headers["X-OmniVoice-RTF"] = f"{rtf:.4f}"
             if app.state.save_dir is not None:
@@ -805,7 +823,7 @@ def create_app(
                 headers["X-OmniVoice-Saved-Path"] = str(saved_path)
 
             logger.info(
-                "request_id=%s status=success mode=%s started_at=%s finished_at=%s latency_ms=%.2f queue_wait_ms=%.2f batch_exec_ms=%.2f batch_requests=%s batch_prompts=%s batch_est_mem_mb=%s lane=%s audio_s=%.3f rtf=%s text_chars=%d has_ref_audio=%s language=%s device=%s saved_path=%s",
+                "request_id=%s status=success mode=%s started_at=%s finished_at=%s latency_ms=%.2f queue_wait_ms=%.2f batch_exec_ms=%.2f batch_requests=%s batch_prompts=%s batch_est_mem_mb=%s gpu_peak_util_pct=%s gpu_peak_used_mb=%s torch_peak_alloc_mb=%s torch_peak_reserved_mb=%s lane=%s audio_s=%.3f rtf=%s text_chars=%d has_ref_audio=%s language=%s device=%s saved_path=%s",
                 request_id,
                 mode.value,
                 started_at,
@@ -818,6 +836,26 @@ def create_app(
                 f"{estimated_batch_memory_mb:.2f}"
                 if estimated_batch_memory_mb is not None
                 else "n/a",
+                (
+                    f"{float(gpu_metrics['gpu_utilization_peak_pct']):.2f}"
+                    if gpu_metrics.get("gpu_utilization_peak_pct") is not None
+                    else "n/a"
+                ),
+                (
+                    f"{float(gpu_metrics['gpu_memory_used_peak_mb']):.2f}"
+                    if gpu_metrics.get("gpu_memory_used_peak_mb") is not None
+                    else "n/a"
+                ),
+                (
+                    f"{float(gpu_metrics['torch_peak_allocated_mb']):.2f}"
+                    if gpu_metrics.get("torch_peak_allocated_mb") is not None
+                    else "n/a"
+                ),
+                (
+                    f"{float(gpu_metrics['torch_peak_reserved_mb']):.2f}"
+                    if gpu_metrics.get("torch_peak_reserved_mb") is not None
+                    else "n/a"
+                ),
                 lane,
                 audio_duration,
                 f"{rtf:.4f}" if rtf is not None else "n/a",
