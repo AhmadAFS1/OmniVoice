@@ -54,6 +54,57 @@ postprocess_output=false
   maximize throughput subject to a reasonable batch execution SLA.
 - For this workload, a single GPU is currently sustaining only about
   `5.5-6.1 req/s`, far below an offered load of `50 req/s`.
+- Under heavy overload, the server-reported latency headers significantly
+  understate real end-user wait time because many requests spend a large amount
+  of time outside the in-app batch queue before they are actually admitted.
+
+## Important Measurement Interpretation
+
+This project now records two different latency concepts:
+
+### 1. Server-Reported Latency
+
+This corresponds to:
+
+- `Latency ms`
+- `Queue wait ms`
+- `Batch exec ms`
+
+These come from response headers emitted by the API server.
+
+Interpretation:
+
+- useful for understanding what happens **inside** the app once a request has
+  been admitted and starts moving through request handling and batching
+- **not** a complete representation of end-user wait under severe overload
+
+### 2. Client-Observed End-to-End Latency
+
+This corresponds to:
+
+- `Local wall ms`
+
+In the benchmark script, this is measured around the entire `curl` subprocess.
+
+Interpretation:
+
+- much closer to the real user-perceived wait time
+- includes:
+  - client-side launch delay
+  - OS / networking backlog
+  - time before the request is fully admitted into the app
+  - server-side request handling
+  - server-side queue wait
+  - batch execution
+
+### Practical Rule
+
+For realistic load interpretation:
+
+- use `Local wall ms` as the primary end-user latency metric
+- use `Latency ms` and `Queue wait ms` only to understand the in-app portion
+
+This distinction becomes extremely important at high overload.
 
 ## Phase 1: Early One-Off Runs
 
@@ -559,6 +610,10 @@ For the current implementation and current benchmark shape:
 - optimizing for raw VRAM usage alone is the wrong target
 - the new telemetry strongly suggests the current workload is compute-bound
   during batches rather than memory-capacity-bound
+- the server-reported latency headers are **not** the real end-user latency
+  metric under overload
+- under heavy load, client-observed wait time can be dramatically worse than
+  the internal server timing headers suggest
 
 The best next-step hypotheses are:
 
@@ -597,3 +652,69 @@ And when testing server-side changes, always record:
 
 This document should be extended before changing multiple knobs at once so the
 serving history stays interpretable.
+
+## Phase 8: Overload Interpretation With 1000 Requests
+
+The `1000 requests over 2 seconds` benchmark exposed an important measurement
+truth that was previously easy to miss:
+
+- server-side latency stayed in the single-digit-second range
+- real client-observed wait time became much larger
+
+Observed benchmark summary:
+
+- Requests: `1000`
+- Concurrency: `1000`
+- Launch window: `2.00s`
+- Successes: `1000`
+- Total wall time: `172.97s`
+- Effective throughput: `5.78 req/s`
+
+Key metrics:
+
+- `Latency ms`
+  - mean `6813.75`
+  - p50 `6833.22`
+  - p95 `6973.88`
+  - p99 `7458.99`
+- `Queue wait ms`
+  - mean `2212.86`
+  - p50 `1402.84`
+  - p95 `5451.61`
+  - p99 `5499.53`
+- `Batch exec ms`
+  - mean `4535.41`
+  - p50 `5382.86`
+  - p95 `5414.48`
+  - p99 `5423.57`
+- `Local wall ms`
+  - mean `88011.65`
+  - p50 `88756.44`
+  - p95 `163501.11`
+  - p99 `170307.32`
+
+### Interpretation
+
+This means:
+
+- server-side median latency was only about `6.8s`
+- but end-user median wait was about `88.8s`
+
+That is the real user-facing number.
+
+The gap exists because many requests were waiting **before** they reached the
+in-app server timing path. In other words, at this level of overload there is
+substantial backlog outside the measured server queue.
+
+### Updated Operational Lesson
+
+When load is far above sustainable throughput:
+
+- `Latency ms` can make the system look much healthier than it really is
+- `Local wall ms` is the correct metric for end-user experience
+
+So future optimization work should optimize for:
+
+- lower `Local wall ms`
+- lower p50 / p95 `Local wall ms`
+- not just lower in-app `Latency ms`
