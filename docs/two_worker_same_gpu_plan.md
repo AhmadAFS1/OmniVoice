@@ -567,6 +567,593 @@ Not all of the remaining gap to the `100 requests in 2s` goal will be closed by
 serving changes alone, but the highest-probability wins are now clearly inside
 the model inference path rather than in the outer worker scheduler.
 
+## Expanded Throughput Analysis
+
+This section summarizes the current end-to-end throughput picture using both the
+measured benchmark results and the actual code path in this branch.
+
+### Executive Summary
+
+The current bottleneck is the **model inference loop**, not the HTTP server and
+not the two-worker router.
+
+The evidence is consistent across both design and clone mode:
+
+- requests are being distributed evenly across workers
+- batches are filling correctly
+- GPU utilization is already pinned near `100%`
+- raising the batch cap increases VRAM usage, but only marginally improves
+  throughput
+- larger batches mostly increase `batch_exec_ms` instead of increasing
+  requests-per-second proportionally
+
+Practical meaning:
+
+- we are no longer primarily queue-bound
+- we are now primarily **compute-bound**
+- the best remaining wins are inside the OmniVoice inference path itself
+
+### Request Path Versus Hot Path
+
+At a high level, one API request goes through four stages:
+
+1. request normalization in
+   [omnivoice/serving/service.py](/workspace/OmniVoice/omnivoice/serving/service.py:453)
+2. task preparation in
+   [omnivoice/models/omnivoice.py](/workspace/OmniVoice/omnivoice/models/omnivoice.py:560)
+3. token generation in
+   [omnivoice/models/omnivoice.py](/workspace/OmniVoice/omnivoice/models/omnivoice.py:594)
+4. audio decode and postprocess in
+   [omnivoice/models/omnivoice.py](/workspace/OmniVoice/omnivoice/models/omnivoice.py:642)
+
+For warmed design-mode traffic, stage 3 is by far the dominant cost. For clone
+traffic, stage 3 still dominates steady-state cost, while stage 1 and stage 2
+become more expensive on cache misses because prompt construction is heavier.
+
+### The Real Hot Paths
+
+#### 1. Iterative Denoising Loop
+
+The single most important hot path is
+[OmniVoice._generate_iterative(...)](/workspace/OmniVoice/omnivoice/models/omnivoice.py:1371).
+
+Important properties:
+
+- the model runs a full denoising loop for `num_step` iterations
+- the full LLM backbone is called again on every step
+- the padded batch is rebuilt and updated across the whole target sequence
+
+This means `num_step` is very close to a direct compute multiplier.
+
+#### 2. CFG Doubles Effective Batch Size
+
+In
+[estimate_generation_batch_memory_bytes(...)](/workspace/OmniVoice/omnivoice/models/omnivoice.py:763),
+the code explicitly computes:
+
+- `effective_batch = 2 * batch_size if guidance_scale != 0 else batch_size`
+
+That same doubling shows up in the actual runtime tensors inside
+[_generate_iterative(...)](/workspace/OmniVoice/omnivoice/models/omnivoice.py:1416):
+
+- `batch_input_ids` uses shape `(2 * B, C, S)`
+- `batch_audio_mask` uses shape `(2 * B, S)`
+- `batch_attention_mask` uses shape `(2 * B, 1, S, S)`
+
+So the current production setting of `guidance_scale=2.0` is paying for both
+the conditional and unconditional branches on every decode step.
+
+#### 3. Dense Attention Mask Materialization
+
+The iterative path currently creates a dense boolean mask tensor here:
+
+- [omnivoice/models/omnivoice.py](/workspace/OmniVoice/omnivoice/models/omnivoice.py:1425)
+
+This is expensive because:
+
+- memory grows with `S^2`
+- writes happen on every merged batch
+- the mask contributes bandwidth pressure even before the real transformer work
+  begins
+
+This is especially important because the model already contains a more compact
+masking path in
+[OmniVoice.forward(...)](/workspace/OmniVoice/omnivoice/models/omnivoice.py:370),
+where `document_ids` can be used to build a packed block mask instead of an
+explicit dense mask.
+
+#### 4. Python Per-Item Scoring And Update Loop
+
+After each model forward, the code loops item-by-item in Python:
+
+- [omnivoice/models/omnivoice.py](/workspace/OmniVoice/omnivoice/models/omnivoice.py:1487)
+
+Inside that loop it:
+
+- slices conditional and unconditional logits
+- computes guided scores
+- applies penalties and optional Gumbel noise
+- runs `topk`
+- writes selected tokens back into the shared batch tensors
+
+This is repeated `num_step` times, so even moderate Python overhead becomes
+meaningful at scale.
+
+#### 5. Clone Conditioning Length
+
+Clone mode is heavier even after prompt caches are warm because reference audio
+tokens are included directly in the conditioning sequence:
+
+- sequence-length estimate includes `ref_audio_tokens.size(-1)` in
+  [omnivoice/models/omnivoice.py](/workspace/OmniVoice/omnivoice/models/omnivoice.py:728)
+- inference input appends those tokens in
+  [omnivoice/models/omnivoice.py](/workspace/OmniVoice/omnivoice/models/omnivoice.py:1351)
+
+That means longer clone prompts increase:
+
+- attention length
+- hidden-state work
+- logits footprint
+- total batch execution time
+
+This matches the observed benchmark regression from design mode to clone mode.
+
+#### 6. Clone Prompt Construction On Cache Miss
+
+On cache misses, clone mode also pays additional request-side cost in
+[create_voice_clone_prompt(...)](/workspace/OmniVoice/omnivoice/models/omnivoice.py:836):
+
+- load or resample audio
+- RMS normalization
+- optional trimming and silence removal
+- optional Whisper transcription if `ref_text` is absent
+- audio-token encoding
+
+The service already caches these prompts in
+[omnivoice/serving/service.py](/workspace/OmniVoice/omnivoice/serving/service.py:474),
+so this is not the main steady-state throughput bottleneck, but it does matter
+for cold clone traffic and for cache-miss heavy workloads.
+
+#### 7. Audio Decode And Postprocess
+
+Audio decode is implemented in
+[decode_tokens(...)](/workspace/OmniVoice/omnivoice/models/omnivoice.py:642),
+with optional silence removal and fade/pad in
+[_post_process_audio(...)](/workspace/OmniVoice/omnivoice/models/omnivoice.py:974).
+
+This stage is real work, but it is still secondary relative to the iterative
+token-generation loop for the benchmark profile we have been running.
+
+### What The Two-Worker Benchmarks Actually Proved
+
+The two-worker architecture test was still useful, because it ruled out some
+wrong intuitions:
+
+- the router is not the bottleneck
+- one worker being overloaded while the other idles is not the bottleneck
+- “just remove the batch cap” is not the answer by itself
+
+The measurements show:
+
+- per-worker cap `12`: about `5.63 req/s`
+- per-worker cap `24`: about `5.75 req/s`
+
+That tiny gain came with a large increase in `batch_exec_ms`, which means the
+GPU is already doing all the work it can on this request shape.
+
+### Design Mode Versus Clone Mode
+
+Design mode is currently the best throughput path for this server. Clone mode is
+materially slower because it carries extra conditioning tokens and more memory
+pressure.
+
+Observed practical behavior:
+
+- design mode at `24` per-worker cap: `~5.75 req/s`, peak GPU memory `~13.2 GB`
+- warmed clone mode with a `6.2s` reference clip: `~2.81 req/s`, peak GPU
+  memory `~21.9 GB`
+
+That means long reference prompts are not just a little slower; they are a
+major throughput limiter on a single `RTX 3090`.
+
+### Secondary Costs Worth Tracking But Not Prioritizing First
+
+These are real costs, but they are not the first place to spend engineering
+effort:
+
+- request parsing and WAV serialization in
+  [omnivoice/serving/service.py](/workspace/OmniVoice/omnivoice/serving/service.py:59)
+- router-side worker selection in
+  [omnivoice/serving/multiworker.py](/workspace/OmniVoice/omnivoice/serving/multiworker.py:380)
+- online micro-batch selection in
+  [omnivoice/serving/batching.py](/workspace/OmniVoice/omnivoice/serving/batching.py:560)
+
+These matter operationally, but they are not where the 3090 is currently
+spending most of its time.
+
+## External Optimization Analysis: Triton Vs TensorRT
+
+An external suggestion was to look at the open-source `omnivoice-triton`
+project, which reports a large OmniVoice speedup using Triton kernel fusion,
+CUDA Graphs, and optional SageAttention.
+
+Relevant sources:
+
+- `omnivoice-triton` GitHub:
+  `https://github.com/newgrit1004/omnivoice-triton`
+- `omnivoice-triton` PyPI:
+  `https://pypi.org/project/omnivoice-triton/`
+- NVIDIA TensorRT dynamic shapes docs:
+  `https://docs.nvidia.com/deeplearning/tensorrt/10.13.3/inference-library/work-dynamic-shapes.html`
+- Torch-TensorRT performance guide:
+  `https://docs.pytorch.org/TensorRT/user_guide/performance_tuning.html`
+
+### What Looks Promising About The Triton Approach
+
+The external Triton project is compelling because its optimization targets match
+this repo’s actual hotspots:
+
+- fused RMSNorm
+- fused SwiGLU
+- fused norm + residual
+- CUDA Graph replay of repeated fixed-shape forwards
+
+That maps well onto the current OmniVoice path here, where:
+
+- the same LLM forward runs repeatedly in the iterative loop
+- the model uses norm and MLP-heavy transformer blocks
+- batch shapes are often similar across requests in the same benchmark class
+
+### Important Caveats About The Reported Speedup
+
+The external project’s headline benchmark should be treated carefully:
+
+- it was measured on an `RTX 5090`
+- it was measured at `batch size 1`
+- it uses Python `>=3.12`
+- it targets the pip `omnivoice` package rather than this serving fork
+
+So the reported `~3.4x` should be viewed as a directional signal, not an
+expected result for this branch on a `3090` under `100` concurrent requests.
+
+### Current Environment Compatibility
+
+The current local environment on this branch is:
+
+- Python `3.11.15`
+- PyTorch `2.8.0+cu128`
+- CUDA `12.8`
+- GPU: `NVIDIA GeForce RTX 3090`
+- `triton`: installed
+- `sageattention`: not installed
+- `torch_tensorrt`: not installed
+
+Implication:
+
+- a repo-native Triton implementation is feasible
+- the external package is **not** a direct drop-in as-is because of the Python
+  version mismatch and model/package integration differences
+
+### Why TensorRT Is Not The First Move
+
+TensorRT is powerful, but it is not the best first optimization step for this
+branch.
+
+Reasons:
+
+- this code path is highly shape-dynamic today
+- TensorRT requires optimization profiles for dynamic shapes
+- shape ranges can materially change memory usage and tactic availability
+- Torch-TensorRT performance depends heavily on good graph coverage and low
+  graph-break rates
+- even a partial TRT compile would still leave the iterative Python orchestration
+  outside the engine unless the whole path is refactored first
+
+In other words, TensorRT becomes much more attractive **after**:
+
+- masking is simplified
+- request shapes are bucketed
+- the hot forward path is made more static
+
+### SageAttention Note
+
+One subtle but important observation from the external code is that its
+SageAttention path only applies when `attention_mask is None`.
+
+That means the highest-value parts for this repo are likely:
+
+- Triton fused norms and MLP kernels
+- CUDA Graphs
+
+not SageAttention itself, at least not until the current masking path changes.
+
+### Recommendation
+
+The best external-optimization sequence for this repo is:
+
+1. implement repo-native mask cleanup and shape bucketing
+2. add CUDA Graph capture per worker for a small set of shape buckets
+3. port Triton fused kernels for RMSNorm, SwiGLU, and fused norm+residual
+4. only then evaluate whether TensorRT is worth exploring for a narrower,
+   more static subgraph
+
+## Updated Phase Roadmap
+
+This roadmap supersedes the earlier high-level rollout notes later in this
+document. The intent here is to give us a clear phase-by-phase path that we can
+execute and benchmark one step at a time.
+
+### Phase 0: Instrumentation And Ground Truth
+
+Goal:
+
+- measure exactly where batch time is spent before changing the hot path
+
+Work items:
+
+- add fine-grained timers around:
+  - request normalization
+  - clone prompt cache hit vs miss path
+  - `prepare_generation_task`
+  - `generate_tokens`
+  - `decode_tokens`
+  - per-step model forward
+  - per-step scoring/update
+- add optional NVTX ranges for Nsight Systems
+- log stage timing in worker responses and CSV benchmark output
+
+Success criteria:
+
+- we can break down one benchmark into stage-level timings instead of just
+  `queue_wait_ms` and `batch_exec_ms`
+
+Why first:
+
+- every later optimization should be attributable to a known hot stage
+
+### Phase 1: Product-Knob Throughput Sweep
+
+Goal:
+
+- identify the cheapest throughput wins with no algorithm rewrite
+
+Work items:
+
+- benchmark `guidance_scale` at `0.0`, `0.5`, `1.0`, `2.0`
+- benchmark `num_step` at `8`, `12`, `16`
+- benchmark `postprocess_output=false` for throughput-only lanes
+- benchmark shorter clone prompts around `2.5-3.5s`
+
+Success criteria:
+
+- define at least one "high-throughput" preset and one "balanced" preset
+- quantify how much throughput each product knob buys
+
+Expected impact:
+
+- this is the fastest path to a meaningful gain because CFG and `num_step` are
+  direct compute multipliers
+
+### Phase 2: Dense Mask Elimination
+
+Goal:
+
+- remove the `S^2` dense attention-mask materialization from the iterative path
+
+Work items:
+
+- refactor `_generate_iterative(...)` to use packed or block-mask metadata
+- reuse the `document_ids` / `create_block_mask` path already supported by
+  `forward(...)`
+- verify output parity against the current path
+
+Success criteria:
+
+- no dense `[2B, 1, S, S]` mask allocation in the hot iterative path
+- lower batch memory pressure
+- measurable reduction in `batch_exec_ms`
+
+Expected impact:
+
+- medium to high
+
+### Phase 3: Shape Bucketing
+
+Goal:
+
+- make inference shapes stable enough to benefit from graph replay and better
+  kernel reuse
+
+Work items:
+
+- bucket requests by:
+  - lane
+  - guidance enabled vs disabled
+  - batch-size bucket
+  - target-token bucket
+  - conditioning-length bucket
+- keep merged batches more homogeneous
+- surface bucket IDs in logs and benchmark output
+
+Success criteria:
+
+- repeated requests hit a small number of stable shape classes
+- padding ratio and shape churn both decrease
+
+Expected impact:
+
+- modest alone, but foundational for the next phases
+
+### Phase 4: CUDA Graph Capture Per Worker
+
+Goal:
+
+- reduce kernel-launch and Python overhead for repeated fixed-shape forwards
+
+Work items:
+
+- add CUDA Graph capture keyed by the Phase 3 shape buckets
+- keep a bounded graph cache per worker
+- add graph-hit / graph-miss telemetry
+
+Success criteria:
+
+- repeated bursts reuse captured graphs reliably
+- `batch_exec_ms` decreases for stable-shape traffic
+
+Expected impact:
+
+- potentially large for short-form repeated workloads
+
+### Phase 5: Triton Kernel Fusion
+
+Goal:
+
+- reduce bandwidth-heavy transformer operator overhead
+
+Work items:
+
+- port or reimplement Triton kernels for:
+  - RMSNorm
+  - SwiGLU
+  - fused residual + norm
+- patch the OmniVoice backbone inside each worker
+- validate quality parity on design and clone mode
+
+Success criteria:
+
+- kernel patches are selectable by feature flag
+- no observable regression in output quality
+- measurable end-to-end improvement beyond CUDA Graphs alone
+
+Expected impact:
+
+- medium to high, depending on how dominant these kernels are after Phase 4
+
+### Phase 6: Vectorize The Per-Step Update Logic
+
+Goal:
+
+- remove repeated Python overhead in the scoring and token-update loop
+
+Work items:
+
+- batch `_predict_tokens_with_scoring`
+- vectorize position selection and token update in the common fixed-duration case
+- keep a slower variable-length fallback
+
+Success criteria:
+
+- fewer Python-side per-item operations inside each decode step
+- measurable reduction in per-step overhead
+
+Expected impact:
+
+- medium
+
+### Phase 7: Clone-Mode Specialization
+
+Goal:
+
+- make clone traffic less destructive to server-wide throughput
+
+Work items:
+
+- enforce or recommend shorter reference clips for high-throughput lanes
+- keep clone traffic in distinct batching lanes
+- optionally use lower clone batch caps than design mode
+- strengthen prompt-cache metrics and reuse reporting
+
+Success criteria:
+
+- clone traffic has predictable memory and latency envelopes
+- warmed clone performance improves without hurting design-mode traffic
+
+Expected impact:
+
+- medium operational gain, especially for production stability
+
+### Phase 8: TensorRT Evaluation
+
+Goal:
+
+- evaluate TensorRT only after the inference path is sufficiently static
+
+Work items:
+
+- run Torch-TensorRT `dryrun=True` on the narrowed hot forward path
+- inspect graph coverage and graph breaks
+- test representative optimization profiles for the dominant shape buckets
+
+Success criteria:
+
+- TensorRT shows high coverage on the narrowed path
+- compile complexity is justified by measured improvement
+
+Expected impact:
+
+- unknown today; intentionally deferred until the path is more static
+
+### How We Should Execute The Phases
+
+The recommended order is:
+
+1. Phase 0
+2. Phase 1
+3. Phase 2
+4. Phase 3
+5. Phase 4
+6. Phase 5
+7. Phase 6
+8. Phase 7
+9. Phase 8
+
+Rule for moving forward:
+
+- do not start the next phase until the current one has:
+  - code landed
+  - benchmark deltas recorded
+  - a short written conclusion added to this document
+
+### Benchmark Gate For Every Phase
+
+Every phase should be measured with the same core benchmark unless the phase is
+clone-specific:
+
+```bash
+.venv/bin/python scripts/benchmark_api_batching.py \
+  --url http://127.0.0.1:8002/generate \
+  --requests 100 \
+  --concurrency 100 \
+  --launch-window-s 2 \
+  --mode design \
+  --num-step 16 \
+  --guidance-scale 2.0 \
+  --duration 4.0
+```
+
+Record at minimum:
+
+- effective throughput
+- total wall time
+- mean / p50 / p95 latency
+- queue wait
+- batch exec time
+- worker distribution
+- peak GPU memory used
+- allocator peak allocated / reserved
+
+### Most Likely Highest-ROI Phases
+
+If engineering time is limited, the most likely high-return sequence is:
+
+1. Phase 1
+2. Phase 2
+3. Phase 4
+4. Phase 5
+
+That sequence attacks the biggest known compute multipliers first.
+
 ## Why We Are Testing This
 
 Recent telemetry-backed benchmarks showed:
@@ -635,7 +1222,7 @@ The first benchmark to compare against is:
   --duration 4.0
 ```
 
-## Non-Goals For Phase 1
+## Non-Goals For Initial Multi-Worker Phase
 
 The first version of this plan does **not** try to solve everything at once.
 
@@ -1127,7 +1714,7 @@ timeline still has gaps.
 This is why the experiment is still worth trying even though peak utilization
 already looks high.
 
-## Rollout Plan
+## Earlier Multi-Worker Rollout Plan (Historical)
 
 ### Phase 1
 
@@ -1149,7 +1736,7 @@ already looks high.
 - optional adaptive routing policy
 - optional adaptive batch sizing per worker
 
-## Recommendation
+## Earlier Multi-Worker Recommendation (Historical)
 
 Implement the first same-GPU experiment on the `RTX 3090` as:
 
