@@ -1,0 +1,1 @@
+Hello, this is a generated reference voice for OmniVoice clone mode benchmarking. We are using this clip to measure throughput under concurrent clone requests.
