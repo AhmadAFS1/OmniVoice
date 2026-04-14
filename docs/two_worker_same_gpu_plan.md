@@ -253,6 +253,320 @@ Operational takeaway:
   shortening clone prompts, optimizing the generation path, or adding more GPU
   compute rather than simply allowing bigger merged batches
 
+## Compute-Bound Throughput Improvement Plan
+
+At this point the main limiter is no longer request routing or queueing
+mechanics. The implementation is now clearly **compute-bound** on the GPU for
+both design mode and clone mode.
+
+This section lays out the recommended plan for improving throughput from the
+compute side.
+
+### Core Observation From The Current Model Path
+
+The main short-form generation loop is implemented in
+[omnivoice/models/omnivoice.py](/workspace/OmniVoice/omnivoice/models/omnivoice.py:1371).
+
+The important properties of the current inference path are:
+
+- the model runs an **iterative denoising loop** for `num_step` iterations
+- for each step, it calls the full model again on the padded batch
+- classifier-free guidance doubles the effective batch from `B` to `2B`
+- the code currently builds a dense 4-D boolean attention mask of shape
+  roughly `[2B, 1, S, S]`
+- clone mode increases conditioning length because reference audio tokens are
+  concatenated into the input sequence
+
+Practical implication:
+
+- throughput now scales mostly with:
+  - `num_step`
+  - sequence length
+  - whether guidance is enabled
+  - whether reference audio tokens are present
+
+This means the best remaining wins are in the **inference loop itself**, not in
+adding more queueing layers around it.
+
+### What Not To Prioritize First
+
+Do **not** make the first optimization attempt a traditional KV-cache rewrite.
+
+Reason:
+
+- this is not a standard left-to-right autoregressive decode loop
+- the iterative denoising path progressively updates masked target positions
+  across steps
+- because the target region keeps changing, a normal autoregressive KV-cache
+  does not map cleanly to this algorithm
+
+That does not mean caching is impossible, but it should not be the first
+compute optimization attempt.
+
+## Priority 0: Add Real Per-Stage GPU Profiling
+
+Before deeper code changes, add timing markers inside the hot path so we can
+separate:
+
+- prompt preprocessing
+- iterative token generation
+- token postprocessing / scoring
+- audio tokenizer decode
+
+Recommended instrumentation points:
+
+- `GenerationService.generate(...)`
+  - time `prepare_generation_task`
+  - time `generation_batcher.submit(...)`
+- `GenerationBatcher._process_batch(...)`
+  - separate `generate_tokens` and `decode_tokens`
+- `OmniVoice._generate_iterative(...)`
+  - time the model forward per step
+  - time `_predict_tokens_with_scoring`
+- optional NVTX ranges around each of the above for Nsight Systems
+
+Relevant files:
+
+- [omnivoice/serving/service.py](/workspace/OmniVoice/omnivoice/serving/service.py:394)
+- [omnivoice/serving/batching.py](/workspace/OmniVoice/omnivoice/serving/batching.py:638)
+- [omnivoice/models/omnivoice.py](/workspace/OmniVoice/omnivoice/models/omnivoice.py:1463)
+
+Why this is first:
+
+- we already know we are GPU-bound
+- we still need to know whether the dominant cost is:
+  - LLM forward
+  - attention mask overhead
+  - token scoring
+  - audio decode
+
+## Priority 1: Reduce Or Remove CFG Doubling
+
+This is the highest-leverage optimization exposed directly by the current code.
+
+In `_generate_iterative(...)`, classifier-free guidance creates conditional and
+unconditional branches and runs them together by doubling the effective batch:
+
+- `batch_input_ids` shape uses `2 * B`
+- `batch_audio_mask` shape uses `2 * B`
+- `batch_attention_mask` shape uses `2 * B`
+
+Relevant code:
+
+- [omnivoice/models/omnivoice.py](/workspace/OmniVoice/omnivoice/models/omnivoice.py:1420)
+- [omnivoice/models/omnivoice.py](/workspace/OmniVoice/omnivoice/models/omnivoice.py:1532)
+
+Recommended plan:
+
+1. benchmark `guidance_scale=0.0`
+2. benchmark a reduced-guidance preset such as `0.5` or `1.0`
+3. if quality is acceptable, expose a high-throughput serving lane that uses
+   reduced guidance
+
+Expected impact:
+
+- potentially the single largest throughput gain available without changing the
+  model architecture
+- lower memory pressure
+- lower batch execution time
+
+Why this matters:
+
+- if guidance can be weakened or disabled for some traffic classes, we remove a
+  large fraction of current compute immediately
+
+## Priority 2: Replace Dense Attention Masks In Inference
+
+The current loop builds a dense boolean attention tensor for every batch:
+
+- [omnivoice/models/omnivoice.py](/workspace/OmniVoice/omnivoice/models/omnivoice.py:1425)
+
+This is expensive because:
+
+- memory use grows with `S^2`
+- mask writes and reads consume bandwidth
+- dense masks can block more efficient attention kernel paths
+
+Important code clue:
+
+- `OmniVoice.forward(...)` already supports `document_ids` and `create_block_mask`
+  instead of an explicit dense mask
+
+Relevant code:
+
+- [omnivoice/models/omnivoice.py](/workspace/OmniVoice/omnivoice/models/omnivoice.py:373)
+- [omnivoice/models/omnivoice.py](/workspace/OmniVoice/omnivoice/models/omnivoice.py:382)
+
+Recommended plan:
+
+1. refactor `_generate_iterative(...)` to stop materializing the full dense
+   `[2B, 1, S, S]` mask
+2. use packed or block-mask metadata instead
+3. verify that the chosen path preserves the same masking semantics
+4. re-benchmark design mode and clone mode
+
+Expected impact:
+
+- moderate to large throughput gain
+- lower memory bandwidth pressure
+- better scaling at larger batch sizes and longer clone prompts
+
+## Priority 3: Shape Bucketing + CUDA Graphs / `torch.compile`
+
+Right now batch shapes vary with:
+
+- batch size
+- prompt length
+- target length
+- clone vs non-clone conditioning length
+
+That variability makes it hard to get full benefit from graph capture or
+compilation.
+
+Recommended plan:
+
+1. bucket requests more aggressively by shape:
+   - lane
+   - `num_step`
+   - guidance enabled vs disabled
+   - target-token bucket
+   - conditioning-length bucket
+2. once shapes are stable, capture the iterative forward path with CUDA Graphs
+   or apply `torch.compile` to the inference function
+3. keep a small cache of compiled/graph variants per worker
+
+Why this likely helps:
+
+- the same inference loop runs repeatedly with very similar shapes
+- graph replay can reduce Python and launch overhead
+- compilation is more likely to help once padding and batch shapes are less
+  chaotic
+
+Practical note:
+
+- this should come **after** attention-mask cleanup, because the current dense
+  mask path is likely to limit graph/compile gains
+
+## Priority 4: Vectorize The Per-Item Step Logic
+
+After each model forward, the code loops over each item in the batch in Python:
+
+- extracts per-item conditional/unconditional logits
+- computes scores
+- chooses positions to reveal
+- updates the batched tensors
+
+Relevant code:
+
+- [omnivoice/models/omnivoice.py](/workspace/OmniVoice/omnivoice/models/omnivoice.py:1487)
+
+Recommended plan:
+
+1. detect the common case where all items in a merged batch share the same
+   target length
+2. vectorize `_predict_tokens_with_scoring` across the full batch
+3. replace per-item `topk` and flatten/update logic with batched tensor ops
+4. keep a slower fallback for variable-length batches
+
+Why this is promising:
+
+- your benchmark workloads already tend to use fixed durations
+- fixed-duration traffic means target lengths are often identical
+- this is exactly the situation where the current Python loop is most
+  avoidably wasteful
+
+Expected impact:
+
+- likely smaller than the CFG and attention-mask wins
+- still worthwhile because it attacks step-level overhead that repeats
+  `num_step` times per batch
+
+## Priority 5: Use Shorter And Lighter Clone Prompts
+
+Clone mode is currently much more expensive than design mode because reference
+audio tokens are included in the conditioning sequence.
+
+Relevant code:
+
+- [omnivoice/models/omnivoice.py](/workspace/OmniVoice/omnivoice/models/omnivoice.py:1351)
+- [omnivoice/models/omnivoice.py](/workspace/OmniVoice/omnivoice/models/omnivoice.py:760)
+
+The current clone benchmark used a `6.2s` prompt and pushed peak GPU memory to
+roughly `22 GB`.
+
+Recommended operational policy:
+
+- cap reference audio to about `2.5-3.5s` for high-throughput clone traffic
+- require `ref_text`
+- keep clone traffic in its own batching lane
+- use smaller clone batch caps than design mode
+
+This is partly a workload policy rather than a kernel optimization, but it is
+one of the highest-value ways to reduce actual compute for clone serving.
+
+## Priority 6: Reconsider `num_step` As A Product Tiering Knob
+
+Because the model reruns the forward path once per step, `num_step` is almost a
+direct compute multiplier.
+
+Relevant code:
+
+- [omnivoice/models/omnivoice.py](/workspace/OmniVoice/omnivoice/models/omnivoice.py:1463)
+
+Recommended plan:
+
+1. benchmark `num_step=8`, `12`, and `16`
+2. compare quality for:
+   - design mode
+   - clone mode
+3. define explicit service tiers such as:
+   - high-throughput
+   - balanced
+   - quality-priority
+
+Expected impact:
+
+- potentially close to linear throughput improvement if quality remains
+  acceptable
+
+## Priority 7: System-Level CUDA Hygiene
+
+These are lower-risk environment checks that should accompany the code work:
+
+- verify the GPU is not power- or thermal-throttling under sustained load
+- keep persistence mode enabled
+- monitor clocks, power draw, and throttling reasons during the burst tests
+- ensure no unnecessary CPU-side contention or process oversubscription is
+  reducing GPU feed rate
+
+These checks are unlikely to produce the biggest gain by themselves, but they
+can prevent false negatives while testing the real compute-path changes.
+
+## Suggested Execution Order
+
+Recommended order of work:
+
+1. add fine-grained profiling and NVTX markers
+2. benchmark `guidance_scale=0.0`, `0.5`, `1.0`, `2.0`
+3. refactor the inference loop to eliminate the dense attention mask
+4. add stronger shape bucketing
+5. try CUDA Graphs or `torch.compile`
+6. vectorize the per-item scoring/update path
+7. re-tune per-worker batch caps after the compute path is faster
+
+## Expected Outcome
+
+The most realistic path to materially higher throughput on a single `RTX 3090`
+is:
+
+- reduce effective compute per request
+- make the iterative loop cheaper
+- keep shapes stable enough to unlock better kernels
+
+Not all of the remaining gap to the `100 requests in 2s` goal will be closed by
+serving changes alone, but the highest-probability wins are now clearly inside
+the model inference path rather than in the outer worker scheduler.
+
 ## Why We Are Testing This
 
 Recent telemetry-backed benchmarks showed:
