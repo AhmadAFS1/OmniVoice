@@ -206,6 +206,88 @@ Interpretation:
 - clone batches are harder to keep perfectly packed, and even full batches are
   far more expensive than design-mode batches
 
+### Phase 1 Sweep Result: Design Mode With `num_step=8`, `guidance_scale=1.0`
+
+This was the first concrete Phase 1 throughput sweep result after Phase 0
+instrumentation was added.
+
+Important caveat:
+
+- this result is best interpreted as a **throughput ceiling test**, not
+  automatically as the preferred production preset
+- the product preference is still to stay closer to `num_step=16` with
+  reasonably strong guidance for quality
+
+Benchmark command:
+
+```bash
+.venv/bin/python scripts/benchmark_api_batching.py \
+  --url http://127.0.0.1:8002/generate \
+  --requests 100 \
+  --concurrency 100 \
+  --launch-window-s 2 \
+  --mode design \
+  --num-step 8 \
+  --guidance-scale 1.0 \
+  --duration 4.0
+```
+
+Observed benchmark summary:
+
+| Metric | Result |
+|---|---:|
+| Total wall time | `8.68s` |
+| Effective throughput | `11.53 req/s` |
+| Mean latency | `4910 ms` |
+| P50 latency | `4855 ms` |
+| P95 latency | `7183 ms` |
+| Mean queue wait | `1709 ms` |
+| Mean batch exec | `3185 ms` |
+| Dominant batch sizes | mixed: `24`, `22`, `21`, `18`, `7`, `6`, `1` |
+| Peak GPU memory used | `~14.0 GB` |
+| Worker split | `worker-1=>50`, `worker-2=>50` |
+
+Phase 0 timing breakdown:
+
+| Timing Metric | Result |
+|---|---:|
+| `batch_generate_tokens_ms` mean | `2830 ms` |
+| `batch_decode_tokens_ms` mean | `354 ms` |
+| `model_iterative_total_ms` mean | `2827 ms` |
+| `model_iterative_forward_ms` mean | `1775 ms` |
+| `model_iterative_scoring_ms` mean | `686 ms` |
+| `model_iterative_update_ms` mean | `233 ms` |
+| `model_iterative_setup_ms` mean | `132 ms` |
+| `wav_serialize_ms` mean | `13 ms` |
+| `request_prep_ms` mean | `< 1 ms` |
+
+Interpretation:
+
+- throughput nearly doubled versus the `num_step=16`, `guidance_scale=2.0`
+  design-mode baseline on this branch
+- mean batch execution time dropped from roughly `7.31s` to `3.19s`
+- the forward pass is still the dominant cost, but both forward and scoring
+  costs dropped substantially with the lower-step / lower-guidance preset
+- decode and request-side overhead remain small relative to token generation
+
+Why this result matters:
+
+- it confirms that `num_step` and `guidance_scale` are major compute
+  multipliers in practice, not just in theory
+- it validates the Phase 1 strategy of testing product knobs before deeper
+  kernel or masking rewrites
+
+Why this does **not** end the optimization work:
+
+- the preferred production quality target is still closer to `num_step=16`
+  with decent guidance
+- if that quality bar must be preserved, the remaining throughput gains must
+  come from later phases:
+  - dense-mask elimination
+  - shape bucketing
+  - CUDA Graphs
+  - Triton fused kernels
+
 ### What These Results Tell Us
 
 The same-GPU 2-worker implementation is functioning correctly:
