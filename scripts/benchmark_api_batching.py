@@ -72,6 +72,8 @@ class RequestResult:
     gpu_allocator_peak_reserved_mb: float | None
     audio_duration_s: float | None
     rtf: float | None
+    clone_prompt_cache_hit: bool | None
+    stage_timings_ms: dict[str, float]
     text: str
 
 
@@ -223,6 +225,34 @@ def _header_int(headers: dict[str, str], key: str) -> int | None:
         return None
 
 
+def _header_bool(headers: dict[str, str], key: str) -> bool | None:
+    value = headers.get(key)
+    if value is None or value == "":
+        return None
+    lowered = value.strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _extract_stage_timings_ms(headers: dict[str, str]) -> dict[str, float]:
+    prefix = "x-omnivoice-timing-"
+    suffix = "-ms"
+    timings: dict[str, float] = {}
+    for key, value in headers.items():
+        if not key.startswith(prefix) or not key.endswith(suffix):
+            continue
+        try:
+            metric_value = float(value)
+        except ValueError:
+            continue
+        metric_name = key[len(prefix) : -len(suffix)].replace("-", "_") + "_ms"
+        timings[metric_name] = metric_value
+    return timings
+
+
 def run_one_request(args: argparse.Namespace, index: int, text: str) -> RequestResult:
     cmd = [
         args.curl_bin,
@@ -294,6 +324,8 @@ def run_one_request(args: argparse.Namespace, index: int, text: str) -> RequestR
             gpu_allocator_peak_reserved_mb=None,
             audio_duration_s=None,
             rtf=None,
+            clone_prompt_cache_hit=None,
+            stage_timings_ms={},
             text=text,
         )
 
@@ -328,6 +360,8 @@ def run_one_request(args: argparse.Namespace, index: int, text: str) -> RequestR
             gpu_allocator_peak_reserved_mb=None,
             audio_duration_s=None,
             rtf=None,
+            clone_prompt_cache_hit=None,
+            stage_timings_ms={},
             text=text,
         )
 
@@ -381,6 +415,10 @@ def run_one_request(args: argparse.Namespace, index: int, text: str) -> RequestR
         ),
         audio_duration_s=_header_float(headers, "x-omnivoice-audio-duration-s"),
         rtf=_header_float(headers, "x-omnivoice-rtf"),
+        clone_prompt_cache_hit=_header_bool(
+            headers, "x-omnivoice-clone-prompt-cache-hit"
+        ),
+        stage_timings_ms=_extract_stage_timings_ms(headers),
         text=text,
     )
 
@@ -400,6 +438,13 @@ def run_scheduled_request(
 
 
 def write_csv(path: str, results: list[RequestResult]) -> None:
+    stage_timing_columns = sorted(
+        {
+            f"timing_{timing_name}"
+            for result in results
+            for timing_name in result.stage_timings_ms.keys()
+        }
+    )
     fieldnames = [
         "index",
         "ok",
@@ -428,13 +473,49 @@ def write_csv(path: str, results: list[RequestResult]) -> None:
         "gpu_allocator_peak_reserved_mb",
         "audio_duration_s",
         "rtf",
+        "clone_prompt_cache_hit",
+        *stage_timing_columns,
         "text",
     ]
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for result in results:
-            writer.writerow(result.__dict__)
+            row = {
+                "index": result.index,
+                "ok": result.ok,
+                "http_status": result.http_status,
+                "error": result.error,
+                "local_wall_ms": result.local_wall_ms,
+                "request_id": result.request_id,
+                "latency_ms": result.latency_ms,
+                "queue_wait_ms": result.queue_wait_ms,
+                "batch_exec_ms": result.batch_exec_ms,
+                "batch_requests": result.batch_requests,
+                "batch_prompts": result.batch_prompts,
+                "batch_target_tokens": result.batch_target_tokens,
+                "batch_max_sequence_length": result.batch_max_sequence_length,
+                "batch_estimated_memory_mb": result.batch_estimated_memory_mb,
+                "worker_id": result.worker_id,
+                "worker_pid": result.worker_pid,
+                "gpu_utilization_peak_pct": result.gpu_utilization_peak_pct,
+                "gpu_memory_total_mb": result.gpu_memory_total_mb,
+                "gpu_memory_used_peak_mb": result.gpu_memory_used_peak_mb,
+                "gpu_memory_free_before_mb": result.gpu_memory_free_before_mb,
+                "gpu_memory_free_after_mb": result.gpu_memory_free_after_mb,
+                "gpu_allocator_allocated_mb": result.gpu_allocator_allocated_mb,
+                "gpu_allocator_reserved_mb": result.gpu_allocator_reserved_mb,
+                "gpu_allocator_peak_allocated_mb": result.gpu_allocator_peak_allocated_mb,
+                "gpu_allocator_peak_reserved_mb": result.gpu_allocator_peak_reserved_mb,
+                "audio_duration_s": result.audio_duration_s,
+                "rtf": result.rtf,
+                "clone_prompt_cache_hit": result.clone_prompt_cache_hit,
+                "text": result.text,
+            }
+            for column in stage_timing_columns:
+                timing_name = column[len("timing_") :]
+                row[column] = result.stage_timings_ms.get(timing_name)
+            writer.writerow(row)
 
 
 def print_summary(
@@ -491,6 +572,23 @@ def print_summary(
         [r.local_wall_ms for r in successes if r.local_wall_ms is not None],
     )
 
+    stage_timing_keys = sorted(
+        {
+            key
+            for result in successes
+            for key in result.stage_timings_ms.keys()
+        }
+    )
+    for timing_key in stage_timing_keys:
+        emit_metric(
+            f"Timing {timing_key}",
+            [
+                result.stage_timings_ms[timing_key]
+                for result in successes
+                if timing_key in result.stage_timings_ms
+            ],
+        )
+
     batch_hist: dict[int, int] = {}
     for result in successes:
         if result.batch_requests is not None:
@@ -514,6 +612,15 @@ def print_summary(
                 f"{worker_id}=>{count}"
                 for worker_id, count in sorted(worker_hist.items())
             )
+        )
+
+    cache_hit_true = sum(1 for result in successes if result.clone_prompt_cache_hit is True)
+    cache_hit_false = sum(
+        1 for result in successes if result.clone_prompt_cache_hit is False
+    )
+    if cache_hit_true or cache_hit_false:
+        print(
+            f"Clone prompt cache hits: true=>{cache_hit_true}, false=>{cache_hit_false}"
         )
 
     emit_metric(

@@ -32,6 +32,7 @@ import logging
 import math
 import os
 import re
+import time
 from dataclasses import dataclass, fields
 from functools import partial
 from typing import Any, List, Optional, Union
@@ -61,6 +62,7 @@ from omnivoice.utils.audio import (
 )
 from omnivoice.utils.duration import RuleDurationEstimator
 from omnivoice.utils.lang_map import LANG_IDS, LANG_NAMES
+from omnivoice.utils.profiling import add_timing, timed_stage
 from omnivoice.utils.text import add_punctuation, chunk_text_punctuation
 from omnivoice.utils.voice_design import (
     _INSTRUCT_ALL_VALID,
@@ -596,6 +598,7 @@ class OmniVoice(PreTrainedModel):
         self,
         task: GenerationTask,
         generation_config: Optional[OmniVoiceGenerationConfig] = None,
+        _profile: Optional[dict[str, float]] = None,
         **kwargs,
     ) -> list[Union[torch.Tensor, List[torch.Tensor]]]:
         """Run stage-1 generation and return audio token outputs."""
@@ -614,30 +617,49 @@ class OmniVoice(PreTrainedModel):
 
         self.eval()
 
-        short_idx, long_idx = task.get_indices(
-            gen_config, self.audio_tokenizer.config.frame_rate
-        )
+        with timed_stage(
+            _profile,
+            "model_generate_tokens_total_ms",
+            "omnivoice.generate_tokens.total",
+        ):
+            short_idx, long_idx = task.get_indices(
+                gen_config, self.audio_tokenizer.config.frame_rate
+            )
 
-        results: list[Union[torch.Tensor, List[torch.Tensor], None]] = [None] * task.batch_size
+            results: list[Union[torch.Tensor, List[torch.Tensor], None]] = [None] * task.batch_size
 
-        if short_idx:
-            short_task = task.slice_task(short_idx)
-            short_results = self._generate_iterative(short_task, gen_config)
-            for idx, res in zip(short_idx, short_results):
-                results[idx] = res
+            if short_idx:
+                short_task = task.slice_task(short_idx)
+                with timed_stage(
+                    _profile,
+                    "model_generate_tokens_short_iterative_ms",
+                    "omnivoice.generate_tokens.short_iterative",
+                ):
+                    short_results = self._generate_iterative(
+                        short_task, gen_config, _profile=_profile
+                    )
+                for idx, res in zip(short_idx, short_results):
+                    results[idx] = res
 
-        if long_idx:
-            long_task = task.slice_task(long_idx)
-            long_results = self._generate_chunked(long_task, gen_config)
-            for idx, res in zip(long_idx, long_results):
-                results[idx] = res
+            if long_idx:
+                long_task = task.slice_task(long_idx)
+                with timed_stage(
+                    _profile,
+                    "model_generate_tokens_long_chunked_ms",
+                    "omnivoice.generate_tokens.long_chunked",
+                ):
+                    long_results = self._generate_chunked(
+                        long_task, gen_config, _profile=_profile
+                    )
+                for idx, res in zip(long_idx, long_results):
+                    results[idx] = res
 
-        finalized: list[Union[torch.Tensor, List[torch.Tensor]]] = []
-        for i, result in enumerate(results):
-            assert result is not None, f"Result {i} was not generated"
-            finalized.append(result)
+            finalized: list[Union[torch.Tensor, List[torch.Tensor]]] = []
+            for i, result in enumerate(results):
+                assert result is not None, f"Result {i} was not generated"
+                finalized.append(result)
 
-        return finalized
+            return finalized
 
     @torch.inference_mode()
     def decode_tokens(
@@ -646,6 +668,7 @@ class OmniVoice(PreTrainedModel):
         ref_rms: Union[float, list[Optional[float]], None] = None,
         generation_config: Optional[OmniVoiceGenerationConfig] = None,
         postprocess_output: Union[bool, list[bool], None] = None,
+        _profile: Optional[dict[str, float]] = None,
         **kwargs,
     ) -> list[torch.Tensor]:
         """Decode stage-1 token outputs into waveform tensors.
@@ -667,63 +690,92 @@ class OmniVoice(PreTrainedModel):
             else OmniVoiceGenerationConfig.from_dict(kwargs)
         )
 
-        batch_size = len(tokens)
-        if isinstance(ref_rms, list):
-            if len(ref_rms) != batch_size:
-                raise ValueError(
-                    "ref_rms length must match the number of token outputs"
-                )
-            ref_rms_list = ref_rms
-        else:
-            ref_rms_list = [ref_rms] * batch_size
-
-        if isinstance(postprocess_output, list):
-            if len(postprocess_output) != batch_size:
-                raise ValueError(
-                    "postprocess_output length must match the number of token outputs"
-                )
-            postprocess_flags = postprocess_output
-        elif postprocess_output is None:
-            postprocess_flags = [gen_config.postprocess_output] * batch_size
-        else:
-            postprocess_flags = [postprocess_output] * batch_size
-
-        tokenizer_device = self.audio_tokenizer.device
-        results: list[Optional[torch.Tensor]] = [None] * batch_size
-        decode_groups: dict[int, list[int]] = {}
-
-        for i, token_output in enumerate(tokens):
-            if isinstance(token_output, list):
-                chunk_audios = [
-                    self.audio_tokenizer.decode(t.to(tokenizer_device).unsqueeze(0))
-                    .audio_values[0]
-                    .cpu()
-                    for t in token_output
-                ]
-                waveform = cross_fade_chunks(chunk_audios, self.sampling_rate)
-                results[i] = self._post_process_audio(
-                    waveform,
-                    postprocess_output=postprocess_flags[i],
-                    ref_rms=ref_rms_list[i],
-                )
+        with timed_stage(
+            _profile,
+            "model_decode_tokens_total_ms",
+            "omnivoice.decode_tokens.total",
+        ):
+            batch_size = len(tokens)
+            if isinstance(ref_rms, list):
+                if len(ref_rms) != batch_size:
+                    raise ValueError(
+                        "ref_rms length must match the number of token outputs"
+                    )
+                ref_rms_list = ref_rms
             else:
-                decode_groups.setdefault(token_output.size(-1), []).append(i)
+                ref_rms_list = [ref_rms] * batch_size
 
-        for _, group_indices in decode_groups.items():
-            batch_codes = torch.stack([tokens[i] for i in group_indices]).to(tokenizer_device)
-            decoded = self.audio_tokenizer.decode(batch_codes).audio_values.cpu()
-            for batch_idx, item_idx in enumerate(group_indices):
-                results[item_idx] = self._post_process_audio(
-                    decoded[batch_idx],
-                    postprocess_output=postprocess_flags[item_idx],
-                    ref_rms=ref_rms_list[item_idx],
-                )
+            if isinstance(postprocess_output, list):
+                if len(postprocess_output) != batch_size:
+                    raise ValueError(
+                        "postprocess_output length must match the number of token outputs"
+                    )
+                postprocess_flags = postprocess_output
+            elif postprocess_output is None:
+                postprocess_flags = [gen_config.postprocess_output] * batch_size
+            else:
+                postprocess_flags = [postprocess_output] * batch_size
 
-        finalized = []
-        for i, audio in enumerate(results):
-            assert audio is not None, f"Decoded audio {i} was not produced"
-            finalized.append(audio)
-        return finalized
+            tokenizer_device = self.audio_tokenizer.device
+            results: list[Optional[torch.Tensor]] = [None] * batch_size
+            decode_groups: dict[int, list[int]] = {}
+
+            for i, token_output in enumerate(tokens):
+                if isinstance(token_output, list):
+                    with timed_stage(
+                        _profile,
+                        "model_decode_tokens_chunked_decode_ms",
+                        "omnivoice.decode_tokens.chunked_decode",
+                    ):
+                        chunk_audios = [
+                            self.audio_tokenizer.decode(
+                                t.to(tokenizer_device).unsqueeze(0)
+                            )
+                            .audio_values[0]
+                            .cpu()
+                            for t in token_output
+                        ]
+                        waveform = cross_fade_chunks(chunk_audios, self.sampling_rate)
+                    with timed_stage(
+                        _profile,
+                        "model_decode_tokens_postprocess_ms",
+                        "omnivoice.decode_tokens.postprocess",
+                    ):
+                        results[i] = self._post_process_audio(
+                            waveform,
+                            postprocess_output=postprocess_flags[i],
+                            ref_rms=ref_rms_list[i],
+                        )
+                else:
+                    decode_groups.setdefault(token_output.size(-1), []).append(i)
+
+            for _, group_indices in decode_groups.items():
+                with timed_stage(
+                    _profile,
+                    "model_decode_tokens_grouped_decode_ms",
+                    "omnivoice.decode_tokens.grouped_decode",
+                ):
+                    batch_codes = torch.stack([tokens[i] for i in group_indices]).to(
+                        tokenizer_device
+                    )
+                    decoded = self.audio_tokenizer.decode(batch_codes).audio_values.cpu()
+                for batch_idx, item_idx in enumerate(group_indices):
+                    with timed_stage(
+                        _profile,
+                        "model_decode_tokens_postprocess_ms",
+                        "omnivoice.decode_tokens.postprocess",
+                    ):
+                        results[item_idx] = self._post_process_audio(
+                            decoded[batch_idx],
+                            postprocess_output=postprocess_flags[item_idx],
+                            ref_rms=ref_rms_list[item_idx],
+                        )
+
+            finalized = []
+            for i, audio in enumerate(results):
+                assert audio is not None, f"Decoded audio {i} was not produced"
+                finalized.append(audio)
+            return finalized
 
     def estimate_inference_sequence_length(
         self,
@@ -838,6 +890,7 @@ class OmniVoice(PreTrainedModel):
         ref_audio: Union[str, tuple[torch.Tensor, int]],
         ref_text: Optional[str] = None,
         preprocess_prompt: bool = True,
+        _profile: Optional[dict[str, float]] = None,
     ) -> VoiceClonePrompt:
         """Create a reusable voice clone prompt from reference audio.
 
@@ -860,44 +913,54 @@ class OmniVoice(PreTrainedModel):
                 "with OmniVoice.from_pretrained()."
             )
 
-        if isinstance(ref_audio, str):
-            ref_wav = load_audio(ref_audio, self.sampling_rate)
-        else:
-            waveform, sr = ref_audio
-            if waveform.dim() == 1:
-                waveform = waveform.unsqueeze(0)
-            if waveform.size(0) > 1:
-                waveform = torch.mean(waveform, dim=0, keepdim=True)
-            if sr != self.sampling_rate:
-                waveform = torchaudio.functional.resample(
-                    waveform, sr, self.sampling_rate
-                )
-            ref_wav = waveform
+        with timed_stage(
+            _profile,
+            "clone_prompt_load_audio_ms",
+            "omnivoice.clone_prompt.load_audio",
+        ):
+            if isinstance(ref_audio, str):
+                ref_wav = load_audio(ref_audio, self.sampling_rate)
+            else:
+                waveform, sr = ref_audio
+                if waveform.dim() == 1:
+                    waveform = waveform.unsqueeze(0)
+                if waveform.size(0) > 1:
+                    waveform = torch.mean(waveform, dim=0, keepdim=True)
+                if sr != self.sampling_rate:
+                    waveform = torchaudio.functional.resample(
+                        waveform, sr, self.sampling_rate
+                    )
+                ref_wav = waveform
 
         ref_rms = torch.sqrt(torch.mean(torch.square(ref_wav))).item()
         if 0 < ref_rms < 0.1:
             ref_wav = ref_wav * 0.1 / ref_rms
 
         if preprocess_prompt:
-            # Trim long reference audio (>20s) by splitting at the largest silence gap.
-            # Skip trimming when ref_text is user-provided, otherwise the
-            # trimmed audio will no longer match the full transcript.
-            if ref_text is None:
-                ref_wav = trim_long_audio(
-                    ref_wav, self.sampling_rate, trim_threshold=20.0
+            with timed_stage(
+                _profile,
+                "clone_prompt_preprocess_ms",
+                "omnivoice.clone_prompt.preprocess",
+            ):
+                # Trim long reference audio (>20s) by splitting at the largest silence gap.
+                # Skip trimming when ref_text is user-provided, otherwise the
+                # trimmed audio will no longer match the full transcript.
+                if ref_text is None:
+                    ref_wav = trim_long_audio(
+                        ref_wav, self.sampling_rate, trim_threshold=20.0
+                    )
+                ref_wav = remove_silence(
+                    ref_wav,
+                    self.sampling_rate,
+                    mid_sil=200,
+                    lead_sil=100,
+                    trail_sil=200,
                 )
-            ref_wav = remove_silence(
-                ref_wav,
-                self.sampling_rate,
-                mid_sil=200,
-                lead_sil=100,
-                trail_sil=200,
-            )
-            if ref_wav.size(-1) == 0:
-                raise ValueError(
-                    "Reference audio is empty after silence removal. "
-                    "Try setting preprocess_prompt=False."
-                )
+                if ref_wav.size(-1) == 0:
+                    raise ValueError(
+                        "Reference audio is empty after silence removal. "
+                        "Try setting preprocess_prompt=False."
+                    )
 
         ref_duration = ref_wav.size(-1) / self.sampling_rate
         if ref_duration > 20.0:
@@ -910,20 +973,30 @@ class OmniVoice(PreTrainedModel):
 
         # Auto-transcribe if ref_text not provided
         if ref_text is None:
-            if self._asr_pipe is None:
-                logger.info("ASR model not loaded yet, loading on-the-fly ...")
-                self.load_asr_model()
-            ref_text = self.transcribe((ref_wav, self.sampling_rate))
-            logger.debug("Auto-transcribed ref_text: %s", ref_text)
+            with timed_stage(
+                _profile,
+                "clone_prompt_asr_ms",
+                "omnivoice.clone_prompt.asr",
+            ):
+                if self._asr_pipe is None:
+                    logger.info("ASR model not loaded yet, loading on-the-fly ...")
+                    self.load_asr_model()
+                ref_text = self.transcribe((ref_wav, self.sampling_rate))
+                logger.debug("Auto-transcribed ref_text: %s", ref_text)
 
         chunk_size = self.audio_tokenizer.config.hop_length
         clip_size = int(ref_wav.size(-1) % chunk_size)
         ref_wav = ref_wav[:, :-clip_size] if clip_size > 0 else ref_wav
-        ref_audio_tokens = self.audio_tokenizer.encode(
-            ref_wav.unsqueeze(0).to(self.audio_tokenizer.device),
-        ).audio_codes.squeeze(
-            0
-        )  # (C, T)
+        with timed_stage(
+            _profile,
+            "clone_prompt_encode_ms",
+            "omnivoice.clone_prompt.encode",
+        ):
+            ref_audio_tokens = self.audio_tokenizer.encode(
+                ref_wav.unsqueeze(0).to(self.audio_tokenizer.device),
+            ).audio_codes.squeeze(
+                0
+            )  # (C, T)
 
         if preprocess_prompt:
             ref_text = add_punctuation(ref_text)
@@ -1011,7 +1084,10 @@ class OmniVoice(PreTrainedModel):
         return generated_audio
 
     def _generate_chunked(
-        self, task: GenerationTask, gen_config: OmniVoiceGenerationConfig
+        self,
+        task: GenerationTask,
+        gen_config: OmniVoiceGenerationConfig,
+        _profile: Optional[dict[str, float]] = None,
     ) -> List[List[torch.Tensor]]:
         """Generate long audio by splitting text into chunks and batching.
 
@@ -1026,100 +1102,107 @@ class OmniVoice(PreTrainedModel):
         Returns:
             Per-item list of chunk token-tensor lists.
         """
-        # Chunk each item's text
-        all_chunks = []
-        for i in range(task.batch_size):
-            avg_tokens_per_char = task.target_lens[i] / len(task.texts[i])
-            text_chunk_len = int(
-                gen_config.audio_chunk_duration
-                * self.audio_tokenizer.config.frame_rate
-                / avg_tokens_per_char
-            )
-            chunks = chunk_text_punctuation(
-                text=task.texts[i],
-                chunk_len=text_chunk_len,
-                min_chunk_len=3,
-            )
-            logger.debug(f"Item {i} chunked into {len(chunks)} pieces: {chunks}")
-            all_chunks.append(chunks)
-
-        has_ref = [t is not None for t in task.ref_audio_tokens]
-        assert all(has_ref) or not any(has_ref), (
-            "Chunked inference requires all items to either have or not have "
-            "ref_audio. Mixed ref/non-ref is not supported."
-        )
-
-        max_num_chunks = max(len(c) for c in all_chunks)
-
-        # chunk_results[item_idx] = list of generated token tensors per chunk
-        chunk_results = [[] for _ in range(task.batch_size)]
-
-        def _run_batch(indices, texts, ref_audios, ref_texts):
-            speed_list = task.speed
-            target_lens = [
-                self._estimate_target_tokens(
-                    texts[j],
-                    ref_texts[j],
-                    ref_audios[j].size(-1) if ref_audios[j] is not None else None,
-                    speed=speed_list[i] if speed_list else 1.0,
+        with timed_stage(
+            _profile,
+            "model_chunked_total_ms",
+            "omnivoice.chunked.total",
+        ):
+            # Chunk each item's text
+            all_chunks = []
+            for i in range(task.batch_size):
+                avg_tokens_per_char = task.target_lens[i] / len(task.texts[i])
+                text_chunk_len = int(
+                    gen_config.audio_chunk_duration
+                    * self.audio_tokenizer.config.frame_rate
+                    / avg_tokens_per_char
                 )
-                for j, i in enumerate(indices)
-            ]
-            sub_task = GenerationTask(
-                batch_size=len(indices),
-                texts=texts,
-                target_lens=target_lens,
-                langs=[task.langs[i] for i in indices],
-                instructs=[task.instructs[i] for i in indices],
-                ref_texts=ref_texts,
-                ref_audio_tokens=ref_audios,
-                ref_rms=[task.ref_rms[i] for i in indices],
-                speed=[task.speed[i] for i in indices] if task.speed else None,
-            )
-            gen_tokens = self._generate_iterative(sub_task, gen_config)
-            for j, idx in enumerate(indices):
-                chunk_results[idx].append(gen_tokens[j])
+                chunks = chunk_text_punctuation(
+                    text=task.texts[i],
+                    chunk_len=text_chunk_len,
+                    min_chunk_len=3,
+                )
+                logger.debug(f"Item {i} chunked into {len(chunks)} pieces: {chunks}")
+                all_chunks.append(chunks)
 
-        if all(has_ref):
-            # All items have reference audio.
-            # We still sequentially generate chunks within each item, but we
-            # batch across items for the same chunk index. This allows to keep
-            # the VRAM usage manageable while still benefiting from batching.
-            for ci in range(max_num_chunks):
-                indices = [i for i in range(task.batch_size) if ci < len(all_chunks[i])]
-                if not indices:
-                    continue
+            has_ref = [t is not None for t in task.ref_audio_tokens]
+            assert all(has_ref) or not any(has_ref), (
+                "Chunked inference requires all items to either have or not have "
+                "ref_audio. Mixed ref/non-ref is not supported."
+            )
+
+            max_num_chunks = max(len(c) for c in all_chunks)
+
+            # chunk_results[item_idx] = list of generated token tensors per chunk
+            chunk_results = [[] for _ in range(task.batch_size)]
+
+            def _run_batch(indices, texts, ref_audios, ref_texts):
+                speed_list = task.speed
+                target_lens = [
+                    self._estimate_target_tokens(
+                        texts[j],
+                        ref_texts[j],
+                        ref_audios[j].size(-1) if ref_audios[j] is not None else None,
+                        speed=speed_list[i] if speed_list else 1.0,
+                    )
+                    for j, i in enumerate(indices)
+                ]
+                sub_task = GenerationTask(
+                    batch_size=len(indices),
+                    texts=texts,
+                    target_lens=target_lens,
+                    langs=[task.langs[i] for i in indices],
+                    instructs=[task.instructs[i] for i in indices],
+                    ref_texts=ref_texts,
+                    ref_audio_tokens=ref_audios,
+                    ref_rms=[task.ref_rms[i] for i in indices],
+                    speed=[task.speed[i] for i in indices] if task.speed else None,
+                )
+                gen_tokens = self._generate_iterative(
+                    sub_task, gen_config, _profile=_profile
+                )
+                for j, idx in enumerate(indices):
+                    chunk_results[idx].append(gen_tokens[j])
+
+            if all(has_ref):
+                # All items have reference audio.
+                # We still sequentially generate chunks within each item, but we
+                # batch across items for the same chunk index. This allows to keep
+                # the VRAM usage manageable while still benefiting from batching.
+                for ci in range(max_num_chunks):
+                    indices = [i for i in range(task.batch_size) if ci < len(all_chunks[i])]
+                    if not indices:
+                        continue
+                    _run_batch(
+                        indices,
+                        texts=[all_chunks[i][ci] for i in indices],
+                        ref_audios=[task.ref_audio_tokens[i] for i in indices],
+                        ref_texts=[task.ref_texts[i] for i in indices],
+                    )
+            else:
+                # No reference audio — generate chunk 0 for all items first,
+                # then use chunk 0 output as reference for all subsequent chunks.
+                indices_0 = [i for i in range(task.batch_size) if len(all_chunks[i]) > 0]
                 _run_batch(
-                    indices,
-                    texts=[all_chunks[i][ci] for i in indices],
-                    ref_audios=[task.ref_audio_tokens[i] for i in indices],
-                    ref_texts=[task.ref_texts[i] for i in indices],
+                    indices_0,
+                    texts=[all_chunks[i][0] for i in indices_0],
+                    ref_audios=[None] * len(indices_0),
+                    ref_texts=[None] * len(indices_0),
                 )
-        else:
-            # No reference audio — generate chunk 0 for all items first,
-            # then use chunk 0 output as reference for all subsequent chunks.
-            indices_0 = [i for i in range(task.batch_size) if len(all_chunks[i]) > 0]
-            _run_batch(
-                indices_0,
-                texts=[all_chunks[i][0] for i in indices_0],
-                ref_audios=[None] * len(indices_0),
-                ref_texts=[None] * len(indices_0),
-            )
-            first_chunk_map = {idx: chunk_results[idx][0] for idx in indices_0}
+                first_chunk_map = {idx: chunk_results[idx][0] for idx in indices_0}
 
-            # Batch all remaining chunks, using chunk 0 as fixed reference
-            for ci in range(1, max_num_chunks):
-                indices = [i for i in range(task.batch_size) if ci < len(all_chunks[i])]
-                if not indices:
-                    continue
-                _run_batch(
-                    indices,
-                    texts=[all_chunks[i][ci] for i in indices],
-                    ref_audios=[first_chunk_map[i] for i in indices],
-                    ref_texts=[all_chunks[i][0] for i in indices],
-                )
+                # Batch all remaining chunks, using chunk 0 as fixed reference
+                for ci in range(1, max_num_chunks):
+                    indices = [i for i in range(task.batch_size) if ci < len(all_chunks[i])]
+                    if not indices:
+                        continue
+                    _run_batch(
+                        indices,
+                        texts=[all_chunks[i][ci] for i in indices],
+                        ref_audios=[first_chunk_map[i] for i in indices],
+                        ref_texts=[all_chunks[i][0] for i in indices],
+                    )
 
-        return chunk_results
+            return chunk_results
 
     def _preprocess_all(
         self,
@@ -1369,7 +1452,10 @@ class OmniVoice(PreTrainedModel):
         }
 
     def _generate_iterative(
-        self, task: GenerationTask, gen_config: OmniVoiceGenerationConfig
+        self,
+        task: GenerationTask,
+        gen_config: OmniVoiceGenerationConfig,
+        _profile: Optional[dict[str, float]] = None,
     ) -> List[torch.Tensor]:
         """N-step iterative unmasked decoding.
 
@@ -1383,144 +1469,176 @@ class OmniVoice(PreTrainedModel):
             input text).
         """
 
-        B = task.batch_size
-
-        for i in range(B):
-            logger.debug(
-                "Item %d — text: %s | ref_text: %s | instruct: %s | lang: %s | target_tokens: %d",
-                i,
-                task.texts[i],
-                task.ref_texts[i],
-                task.instructs[i],
-                task.langs[i],
-                task.target_lens[i],
-            )
-
-        inputs_list = [
-            self._prepare_inference_inputs(
-                task.texts[i],
-                task.target_lens[i],
-                task.ref_texts[i],
-                task.ref_audio_tokens[i],
-                task.langs[i],
-                task.instructs[i],
-                gen_config.denoise,
-            )
-            for i in range(B)
-        ]
-
-        c_lens = [inp["input_ids"].size(2) for inp in inputs_list]
-        max_c_len = max(c_lens)
-        pad_id = self.config.audio_mask_id  # Or any other tokens
-
-        batch_input_ids = torch.full(
-            (2 * B, self.config.num_audio_codebook, max_c_len),
-            pad_id,
-            dtype=torch.long,
-            device=self.device,
-        )
-        batch_audio_mask = torch.zeros(
-            (2 * B, max_c_len), dtype=torch.bool, device=self.device
-        )
-        batch_attention_mask = torch.zeros(
-            (2 * B, 1, max_c_len, max_c_len), dtype=torch.bool, device=self.device
-        )
-
-        for i, inp in enumerate(inputs_list):
-            c_len, u_len = c_lens[i], task.target_lens[i]
-
-            # Cond (0 ~ B-1)
-            batch_input_ids[i, :, :c_len] = inp["input_ids"]
-            batch_audio_mask[i, :c_len] = inp["audio_mask"]
-            batch_attention_mask[i, :, :c_len, :c_len] = True
-
-            # Uncond (B ~ 2B-1)
-            batch_input_ids[B + i, :, :u_len] = inp["input_ids"][..., -u_len:]
-            batch_audio_mask[B + i, :u_len] = inp["audio_mask"][..., -u_len:]
-            batch_attention_mask[B + i, :, :u_len, :u_len] = True
-            if max_c_len > u_len:
-                pad_diag = torch.arange(u_len, max_c_len, device=self.device)
-                batch_attention_mask[B + i, :, pad_diag, pad_diag] = True
-
-        tokens = torch.full(
-            (B, self.config.num_audio_codebook, max(task.target_lens)),
-            self.config.audio_mask_id,
-            dtype=torch.long,
-            device=self.device,
-        )
-
-        timesteps = _get_time_steps(
-            t_start=0.0,
-            t_end=1.0,
-            num_step=gen_config.num_step + 1,
-            t_shift=gen_config.t_shift,
-        ).tolist()
-        schedules = []
-        for t_len in task.target_lens:
-            total_mask = t_len * self.config.num_audio_codebook
-            rem = total_mask
-            sched = []
-            for step in range(gen_config.num_step):
-                num = (
-                    rem
-                    if step == gen_config.num_step - 1
-                    else min(
-                        math.ceil(total_mask * (timesteps[step + 1] - timesteps[step])),
-                        rem,
-                    )
-                )
-                sched.append(int(num))
-                rem -= int(num)
-            schedules.append(sched)
-
-        layer_ids = torch.arange(
-            self.config.num_audio_codebook, device=self.device
-        ).view(1, -1, 1)
-
-        for step in range(gen_config.num_step):
-            batch_logits = self(
-                input_ids=batch_input_ids,
-                audio_mask=batch_audio_mask,
-                attention_mask=batch_attention_mask,
-            ).logits.to(torch.float32)
+        with timed_stage(
+            _profile,
+            "model_iterative_total_ms",
+            "omnivoice.iterative.total",
+        ):
+            B = task.batch_size
 
             for i in range(B):
-                k = schedules[i][step]
-                if k <= 0:
-                    continue
-
-                c_len, t_len = c_lens[i], task.target_lens[i]
-
-                # Extract real target Logits
-                # [1, C, T, V]
-                c_logits = batch_logits[i : i + 1, :, c_len - t_len : c_len, :]
-                u_logits = batch_logits[B + i : B + i + 1, :, :t_len, :]
-
-                pred_tokens, scores = self._predict_tokens_with_scoring(
-                    c_logits, u_logits, gen_config
+                logger.debug(
+                    "Item %d — text: %s | ref_text: %s | instruct: %s | lang: %s | target_tokens: %d",
+                    i,
+                    task.texts[i],
+                    task.ref_texts[i],
+                    task.instructs[i],
+                    task.langs[i],
+                    task.target_lens[i],
                 )
 
-                scores = scores - (layer_ids * gen_config.layer_penalty_factor)
+            with timed_stage(
+                _profile,
+                "model_iterative_setup_ms",
+                "omnivoice.iterative.setup",
+            ):
+                inputs_list = [
+                    self._prepare_inference_inputs(
+                        task.texts[i],
+                        task.target_lens[i],
+                        task.ref_texts[i],
+                        task.ref_audio_tokens[i],
+                        task.langs[i],
+                        task.instructs[i],
+                        gen_config.denoise,
+                    )
+                    for i in range(B)
+                ]
 
-                if gen_config.position_temperature > 0.0:
-                    scores = _gumbel_sample(scores, gen_config.position_temperature)
+                c_lens = [inp["input_ids"].size(2) for inp in inputs_list]
+                max_c_len = max(c_lens)
+                pad_id = self.config.audio_mask_id  # Or any other tokens
 
-                sample_tokens = tokens[i : i + 1, :, :t_len]
-                scores.masked_fill_(
-                    sample_tokens != self.config.audio_mask_id, -float("inf")
+                batch_input_ids = torch.full(
+                    (2 * B, self.config.num_audio_codebook, max_c_len),
+                    pad_id,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                batch_audio_mask = torch.zeros(
+                    (2 * B, max_c_len), dtype=torch.bool, device=self.device
+                )
+                batch_attention_mask = torch.zeros(
+                    (2 * B, 1, max_c_len, max_c_len),
+                    dtype=torch.bool,
+                    device=self.device,
                 )
 
-                _, topk_idx = torch.topk(scores.flatten(), k)
-                flat_tokens = sample_tokens.flatten()
-                flat_tokens[topk_idx] = pred_tokens.flatten()[topk_idx]
-                sample_tokens.copy_(flat_tokens.view_as(sample_tokens))
+                for i, inp in enumerate(inputs_list):
+                    c_len, u_len = c_lens[i], task.target_lens[i]
 
-                # Update individual slices into batched structure
-                tokens[i : i + 1, :, :t_len] = sample_tokens
-                batch_input_ids[i : i + 1, :, c_len - t_len : c_len] = sample_tokens
-                batch_input_ids[B + i : B + i + 1, :, :t_len] = sample_tokens
+                    # Cond (0 ~ B-1)
+                    batch_input_ids[i, :, :c_len] = inp["input_ids"]
+                    batch_audio_mask[i, :c_len] = inp["audio_mask"]
+                    batch_attention_mask[i, :, :c_len, :c_len] = True
 
-        return [tokens[i, :, : task.target_lens[i]] for i in range(B)]
+                    # Uncond (B ~ 2B-1)
+                    batch_input_ids[B + i, :, :u_len] = inp["input_ids"][..., -u_len:]
+                    batch_audio_mask[B + i, :u_len] = inp["audio_mask"][..., -u_len:]
+                    batch_attention_mask[B + i, :, :u_len, :u_len] = True
+                    if max_c_len > u_len:
+                        pad_diag = torch.arange(u_len, max_c_len, device=self.device)
+                        batch_attention_mask[B + i, :, pad_diag, pad_diag] = True
+
+                tokens = torch.full(
+                    (B, self.config.num_audio_codebook, max(task.target_lens)),
+                    self.config.audio_mask_id,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+
+                timesteps = _get_time_steps(
+                    t_start=0.0,
+                    t_end=1.0,
+                    num_step=gen_config.num_step + 1,
+                    t_shift=gen_config.t_shift,
+                ).tolist()
+                schedules = []
+                for t_len in task.target_lens:
+                    total_mask = t_len * self.config.num_audio_codebook
+                    rem = total_mask
+                    sched = []
+                    for step in range(gen_config.num_step):
+                        num = (
+                            rem
+                            if step == gen_config.num_step - 1
+                            else min(
+                                math.ceil(
+                                    total_mask
+                                    * (timesteps[step + 1] - timesteps[step])
+                                ),
+                                rem,
+                            )
+                        )
+                        sched.append(int(num))
+                        rem -= int(num)
+                    schedules.append(sched)
+
+                layer_ids = torch.arange(
+                    self.config.num_audio_codebook, device=self.device
+                ).view(1, -1, 1)
+
+            for step in range(gen_config.num_step):
+                with timed_stage(
+                    _profile,
+                    "model_iterative_forward_ms",
+                    "omnivoice.iterative.forward",
+                ):
+                    batch_logits = self(
+                        input_ids=batch_input_ids,
+                        audio_mask=batch_audio_mask,
+                        attention_mask=batch_attention_mask,
+                    ).logits.to(torch.float32)
+
+                for i in range(B):
+                    k = schedules[i][step]
+                    if k <= 0:
+                        continue
+
+                    c_len, t_len = c_lens[i], task.target_lens[i]
+
+                    scoring_started = time.perf_counter()
+                    # Extract real target Logits
+                    # [1, C, T, V]
+                    c_logits = batch_logits[i : i + 1, :, c_len - t_len : c_len, :]
+                    u_logits = batch_logits[B + i : B + i + 1, :, :t_len, :]
+
+                    pred_tokens, scores = self._predict_tokens_with_scoring(
+                        c_logits, u_logits, gen_config
+                    )
+
+                    scores = scores - (layer_ids * gen_config.layer_penalty_factor)
+
+                    if gen_config.position_temperature > 0.0:
+                        scores = _gumbel_sample(scores, gen_config.position_temperature)
+                    add_timing(
+                        _profile,
+                        "model_iterative_scoring_ms",
+                        (time.perf_counter() - scoring_started) * 1000.0,
+                    )
+
+                    update_started = time.perf_counter()
+                    sample_tokens = tokens[i : i + 1, :, :t_len]
+                    scores.masked_fill_(
+                        sample_tokens != self.config.audio_mask_id, -float("inf")
+                    )
+
+                    _, topk_idx = torch.topk(scores.flatten(), k)
+                    flat_tokens = sample_tokens.flatten()
+                    flat_tokens[topk_idx] = pred_tokens.flatten()[topk_idx]
+                    sample_tokens.copy_(flat_tokens.view_as(sample_tokens))
+
+                    # Update individual slices into batched structure
+                    tokens[i : i + 1, :, :t_len] = sample_tokens
+                    batch_input_ids[i : i + 1, :, c_len - t_len : c_len] = sample_tokens
+                    batch_input_ids[B + i : B + i + 1, :, :t_len] = sample_tokens
+                    add_timing(
+                        _profile,
+                        "model_iterative_update_ms",
+                        (time.perf_counter() - update_started) * 1000.0,
+                    )
+
+            return [tokens[i, :, : task.target_lens[i]] for i in range(B)]
 
     def _predict_tokens_with_scoring(self, c_logits, u_logits, gen_config):
         if gen_config.guidance_scale != 0:

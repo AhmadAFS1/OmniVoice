@@ -907,6 +907,14 @@ Success criteria:
 - we can break down one benchmark into stage-level timings instead of just
   `queue_wait_ms` and `batch_exec_ms`
 
+Implementation status on this branch:
+
+- Phase 0 instrumentation is now implemented in the live serving path
+- request responses emit per-stage timing headers using the
+  `X-OmniVoice-Timing-*-Ms` pattern
+- the benchmark script now captures and summarizes those stage timings
+- optional NVTX ranges can be enabled with `OMNIVOICE_ENABLE_NVTX=1`
+
 Why first:
 
 - every later optimization should be attributable to a known hot stage

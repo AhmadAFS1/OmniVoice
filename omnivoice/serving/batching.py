@@ -19,6 +19,7 @@ import torch
 
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
 from omnivoice.models.omnivoice import GenerationTask, VoiceClonePrompt
+from omnivoice.utils.profiling import timed_stage
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,7 @@ class PendingGenerationResult:
     gpu_metrics: dict[str, object]
     queue_wait_ms: float
     batch_exec_ms: float
+    stage_timings_ms: dict[str, float]
 
 
 @dataclass
@@ -118,12 +120,18 @@ class ClonePromptCache:
     def get_or_create(
         self, cache_key: str, factory: Callable[[], VoiceClonePrompt]
     ) -> VoiceClonePrompt:
+        prompt, _created = self.get_or_create_with_meta(cache_key, factory)
+        return prompt
+
+    def get_or_create_with_meta(
+        self, cache_key: str, factory: Callable[[], VoiceClonePrompt]
+    ) -> tuple[VoiceClonePrompt, bool]:
         with self._lock:
             prompt = self._cache.get(cache_key)
             if prompt is not None:
                 self._hits += 1
                 self._cache.move_to_end(cache_key)
-                return prompt
+                return prompt, False
 
         prompt = factory()
         prompt = VoiceClonePrompt(
@@ -137,7 +145,7 @@ class ClonePromptCache:
             if existing is not None:
                 self._hits += 1
                 self._cache.move_to_end(cache_key)
-                return existing
+                return existing, False
 
             self._misses += 1
             self._cache[cache_key] = prompt
@@ -145,7 +153,7 @@ class ClonePromptCache:
             if len(self._cache) > self.max_entries:
                 self._cache.popitem(last=False)
                 self._evictions += 1
-            return prompt
+            return prompt, True
 
     def stats(self) -> dict:
         with self._lock:
@@ -637,26 +645,49 @@ class GenerationBatcher:
 
     def _process_batch(self, jobs: list[PendingGeneration]) -> None:
         batch_started = time.perf_counter()
-        merged_task = merge_generation_tasks([job.task for job in jobs])
-        merged_postprocess_flags = [
-            flag for job in jobs for flag in job.postprocess_flags
-        ]
+        stage_timings_ms: dict[str, float] = {}
+        with timed_stage(
+            stage_timings_ms,
+            "batch_merge_task_ms",
+            "omnivoice.batch.merge_task",
+        ):
+            merged_task = merge_generation_tasks([job.task for job in jobs])
+            merged_postprocess_flags = [
+                flag for job in jobs for flag in job.postprocess_flags
+            ]
         self._gpu_monitor.begin_batch()
 
         with self._stats_lock:
             self._batches_started += 1
 
         try:
-            token_outputs = self._model.generate_tokens(
-                merged_task,
-                generation_config=jobs[0].generation_config,
-            )
-            audios = self._model.decode_tokens(
-                token_outputs,
-                ref_rms=merged_task.ref_rms,
-                generation_config=jobs[0].generation_config,
-                postprocess_output=merged_postprocess_flags,
-            )
+            model_generate_timings_ms: dict[str, float] = {}
+            with timed_stage(
+                stage_timings_ms,
+                "batch_generate_tokens_ms",
+                "omnivoice.batch.generate_tokens",
+            ):
+                token_outputs = self._model.generate_tokens(
+                    merged_task,
+                    generation_config=jobs[0].generation_config,
+                    _profile=model_generate_timings_ms,
+                )
+            stage_timings_ms.update(model_generate_timings_ms)
+
+            model_decode_timings_ms: dict[str, float] = {}
+            with timed_stage(
+                stage_timings_ms,
+                "batch_decode_tokens_ms",
+                "omnivoice.batch.decode_tokens",
+            ):
+                audios = self._model.decode_tokens(
+                    token_outputs,
+                    ref_rms=merged_task.ref_rms,
+                    generation_config=jobs[0].generation_config,
+                    postprocess_output=merged_postprocess_flags,
+                    _profile=model_decode_timings_ms,
+                )
+            stage_timings_ms.update(model_decode_timings_ms)
 
             batch_exec_ms = (time.perf_counter() - batch_started) * 1000.0
             batch_requests = len(jobs)
@@ -701,6 +732,7 @@ class GenerationBatcher:
                         gpu_metrics=dict(gpu_metrics),
                         queue_wait_ms=queue_wait_ms,
                         batch_exec_ms=batch_exec_ms,
+                        stage_timings_ms=dict(stage_timings_ms),
                     )
                 )
 
@@ -727,10 +759,14 @@ class GenerationBatcher:
                     ),
                     "batch_exec_ms": round(batch_exec_ms, 2),
                     "lane": jobs[0].batch_key.lane,
+                    "stage_timings_ms": {
+                        key: round(value, 2)
+                        for key, value in sorted(stage_timings_ms.items())
+                    },
                 }
 
             logger.info(
-                "[%s] batch status=success requests=%d prompts=%d lane=%s exec_ms=%.2f target_tokens=%d max_sequence_length=%d est_mem_mb=%.2f gpu_peak_util_pct=%s gpu_peak_used_mb=%s gpu_free_before_mb=%s gpu_free_after_mb=%s torch_alloc_mb=%s torch_reserved_mb=%s torch_peak_alloc_mb=%s torch_peak_reserved_mb=%s",
+                "[%s] batch status=success requests=%d prompts=%d lane=%s exec_ms=%.2f target_tokens=%d max_sequence_length=%d est_mem_mb=%.2f gpu_peak_util_pct=%s gpu_peak_used_mb=%s gpu_free_before_mb=%s gpu_free_after_mb=%s torch_alloc_mb=%s torch_reserved_mb=%s torch_peak_alloc_mb=%s torch_peak_reserved_mb=%s stage_timings_ms=%s",
                 self._name,
                 batch_requests,
                 batch_prompts,
@@ -747,6 +783,10 @@ class GenerationBatcher:
                 gpu_metrics.get("torch_reserved_mb"),
                 gpu_metrics.get("torch_peak_allocated_mb"),
                 gpu_metrics.get("torch_peak_reserved_mb"),
+                {
+                    key: round(value, 2)
+                    for key, value in sorted(stage_timings_ms.items())
+                },
             )
         except Exception as exc:
             self._gpu_monitor.end_batch()

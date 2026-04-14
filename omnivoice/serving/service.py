@@ -26,6 +26,7 @@ from omnivoice.serving.batching import (
     PendingGeneration,
     build_clone_prompt_cache_key,
 )
+from omnivoice.utils.profiling import timed_stage
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,16 @@ def _persist_wav_bytes(
     output_path = save_dir / filename
     output_path.write_bytes(wav_bytes)
     return output_path
+
+
+def _timing_header_name(metric_name: str) -> str:
+    base = metric_name[:-3] if metric_name.endswith("_ms") else metric_name
+    return f"X-OmniVoice-Timing-{base.replace('_', '-')}-Ms"
+
+
+def _apply_timing_headers(headers: dict[str, str], timings_ms: dict[str, float]) -> None:
+    for key, value in sorted(timings_ms.items()):
+        headers[_timing_header_name(key)] = f"{value:.2f}"
 
 
 def _iso_utc_now() -> str:
@@ -414,133 +425,175 @@ class GenerationService:
         estimated_batch_memory_mb = None
         gpu_metrics: dict[str, object] = {}
         lane = None
+        request_stage_timings_ms: dict[str, float] = {}
+        batch_stage_timings_ms: dict[str, float] = {}
+        clone_prompt_cache_hit: Optional[bool] = None
 
         try:
-            if cleaned_text is None:
-                raise ValueError("text is required.")
-
-            if request.mode == "auto":
-                if request.ref_audio_bytes is not None:
-                    raise ValueError("ref_audio is only supported for clone mode.")
-                if cleaned_instruct is not None:
-                    raise ValueError(
-                        "instruct is only supported for design or clone mode."
-                    )
-                if cleaned_ref_text is not None:
-                    raise ValueError("ref_text is only supported for clone mode.")
-
-            if request.mode == "design":
-                if cleaned_instruct is None:
-                    raise ValueError("instruct is required for design mode.")
-                if request.ref_audio_bytes is not None:
-                    raise ValueError("ref_audio is only supported for clone mode.")
-                if cleaned_ref_text is not None:
-                    raise ValueError("ref_text is only supported for clone mode.")
-
-            if request.mode == "clone" and request.ref_audio_bytes is None:
-                raise ValueError("ref_audio is required for clone mode.")
-
-            if (
-                request.mode == "clone"
-                and _native_coreml_runtime_enabled(self.model)
-                and cleaned_ref_text is None
+            with timed_stage(
+                request_stage_timings_ms,
+                "request_prep_ms",
+                "omnivoice.service.request_prep",
             ):
-                raise ValueError(
-                    "Clone mode with native Core ML runtime requires ref_text. "
-                    "Whisper auto-transcription is not part of the Apple-native path."
-                )
+                with timed_stage(
+                    request_stage_timings_ms,
+                    "request_validation_ms",
+                    "omnivoice.service.request_validation",
+                ):
+                    if cleaned_text is None:
+                        raise ValueError("text is required.")
 
-            generation_config = OmniVoiceGenerationConfig(
-                num_step=int(request.num_step),
-                guidance_scale=float(request.guidance_scale),
-                denoise=bool(request.denoise),
-                preprocess_prompt=bool(request.preprocess_prompt),
-                postprocess_output=bool(request.postprocess_output),
-            )
+                    if request.mode == "auto":
+                        if request.ref_audio_bytes is not None:
+                            raise ValueError("ref_audio is only supported for clone mode.")
+                        if cleaned_instruct is not None:
+                            raise ValueError(
+                                "instruct is only supported for design or clone mode."
+                            )
+                        if cleaned_ref_text is not None:
+                            raise ValueError("ref_text is only supported for clone mode.")
 
-            task_kwargs: dict[str, Any] = {
-                "text": cleaned_text,
-                "language": cleaned_language,
-            }
-            if cleaned_instruct is not None:
-                task_kwargs["instruct"] = cleaned_instruct
-            if request.speed is not None and float(request.speed) != 1.0:
-                task_kwargs["speed"] = float(request.speed)
-            if request.duration is not None:
-                if float(request.duration) <= 0:
-                    raise ValueError("duration must be greater than 0 when provided.")
-                task_kwargs["duration"] = float(request.duration)
+                    if request.mode == "design":
+                        if cleaned_instruct is None:
+                            raise ValueError("instruct is required for design mode.")
+                        if request.ref_audio_bytes is not None:
+                            raise ValueError("ref_audio is only supported for clone mode.")
+                        if cleaned_ref_text is not None:
+                            raise ValueError("ref_text is only supported for clone mode.")
 
-            if request.ref_audio_bytes is not None:
-                cache_key = build_clone_prompt_cache_key(
-                    request.ref_audio_bytes,
-                    cleaned_ref_text,
-                    bool(request.preprocess_prompt),
-                )
+                    if request.mode == "clone" and request.ref_audio_bytes is None:
+                        raise ValueError("ref_audio is required for clone mode.")
 
-                def _create_prompt():
-                    temp_path = _save_bytes_to_tempfile(
-                        request.ref_audio_bytes or b"",
-                        request.ref_audio_filename,
-                    )
-                    try:
-                        return self.model.create_voice_clone_prompt(
-                            ref_audio=temp_path,
-                            ref_text=cleaned_ref_text,
-                            preprocess_prompt=bool(request.preprocess_prompt),
+                    if (
+                        request.mode == "clone"
+                        and _native_coreml_runtime_enabled(self.model)
+                        and cleaned_ref_text is None
+                    ):
+                        raise ValueError(
+                            "Clone mode with native Core ML runtime requires ref_text. "
+                            "Whisper auto-transcription is not part of the Apple-native path."
                         )
-                    finally:
-                        if os.path.exists(temp_path):
-                            os.unlink(temp_path)
 
-                task_kwargs["voice_clone_prompt"] = self.clone_prompt_cache.get_or_create(
-                    cache_key,
-                    _create_prompt,
+                    generation_config = OmniVoiceGenerationConfig(
+                        num_step=int(request.num_step),
+                        guidance_scale=float(request.guidance_scale),
+                        denoise=bool(request.denoise),
+                        preprocess_prompt=bool(request.preprocess_prompt),
+                        postprocess_output=bool(request.postprocess_output),
+                    )
+
+                    task_kwargs: dict[str, Any] = {
+                        "text": cleaned_text,
+                        "language": cleaned_language,
+                    }
+                    if cleaned_instruct is not None:
+                        task_kwargs["instruct"] = cleaned_instruct
+                    if request.speed is not None and float(request.speed) != 1.0:
+                        task_kwargs["speed"] = float(request.speed)
+                    if request.duration is not None:
+                        if float(request.duration) <= 0:
+                            raise ValueError("duration must be greater than 0 when provided.")
+                        task_kwargs["duration"] = float(request.duration)
+
+                if request.ref_audio_bytes is not None:
+                    cache_key = build_clone_prompt_cache_key(
+                        request.ref_audio_bytes,
+                        cleaned_ref_text,
+                        bool(request.preprocess_prompt),
+                    )
+
+                    def _create_prompt():
+                        temp_path = _save_bytes_to_tempfile(
+                            request.ref_audio_bytes or b"",
+                            request.ref_audio_filename,
+                        )
+                        prompt_timings_ms: dict[str, float] = {}
+                        try:
+                            with timed_stage(
+                                request_stage_timings_ms,
+                                "clone_prompt_create_ms",
+                                "omnivoice.service.clone_prompt_create",
+                            ):
+                                prompt = self.model.create_voice_clone_prompt(
+                                    ref_audio=temp_path,
+                                    ref_text=cleaned_ref_text,
+                                    preprocess_prompt=bool(request.preprocess_prompt),
+                                    _profile=prompt_timings_ms,
+                                )
+                            request_stage_timings_ms.update(prompt_timings_ms)
+                            return prompt
+                        finally:
+                            if os.path.exists(temp_path):
+                                os.unlink(temp_path)
+
+                    with timed_stage(
+                        request_stage_timings_ms,
+                        "clone_prompt_lookup_ms",
+                        "omnivoice.service.clone_prompt_lookup",
+                    ):
+                        (
+                            task_kwargs["voice_clone_prompt"],
+                            prompt_created,
+                        ) = self.clone_prompt_cache.get_or_create_with_meta(
+                            cache_key,
+                            _create_prompt,
+                        )
+                    clone_prompt_cache_hit = not prompt_created
+
+                with timed_stage(
+                    request_stage_timings_ms,
+                    "prepare_task_ms",
+                    "omnivoice.service.prepare_task",
+                ):
+                    prepared_task = self.model.prepare_generation_task(
+                        preprocess_prompt=bool(request.preprocess_prompt),
+                        **task_kwargs,
+                    )
+
+                with timed_stage(
+                    request_stage_timings_ms,
+                    "estimate_sequence_ms",
+                    "omnivoice.service.estimate_sequence",
+                ):
+                    estimated_sequence_lengths = [
+                        self.model.estimate_inference_sequence_length(
+                            text=prepared_task.texts[i],
+                            num_target_tokens=prepared_task.target_lens[i],
+                            ref_text=prepared_task.ref_texts[i],
+                            ref_audio_tokens=prepared_task.ref_audio_tokens[i],
+                            lang=prepared_task.langs[i],
+                            instruct=prepared_task.instructs[i],
+                            denoise=generation_config.denoise,
+                        )
+                        for i in range(prepared_task.batch_size)
+                    ]
+
+                short_idx, long_idx = prepared_task.get_indices(
+                    generation_config,
+                    self.model.audio_tokenizer.config.frame_rate,
                 )
+                if short_idx:
+                    lane = "short_mixed"
+                elif prepared_task.ref_audio_tokens[0] is not None:
+                    lane = "long_ref"
+                else:
+                    lane = "long_no_ref"
+                assert not (
+                    short_idx and long_idx
+                ), "Single request should map to one batching lane"
 
-            prepared_task = self.model.prepare_generation_task(
-                preprocess_prompt=bool(request.preprocess_prompt),
-                **task_kwargs,
-            )
-
-            estimated_sequence_lengths = [
-                self.model.estimate_inference_sequence_length(
-                    text=prepared_task.texts[i],
-                    num_target_tokens=prepared_task.target_lens[i],
-                    ref_text=prepared_task.ref_texts[i],
-                    ref_audio_tokens=prepared_task.ref_audio_tokens[i],
-                    lang=prepared_task.langs[i],
-                    instruct=prepared_task.instructs[i],
+                batch_key = GenerationBatchKey(
+                    num_step=generation_config.num_step,
+                    guidance_scale=generation_config.guidance_scale,
+                    t_shift=generation_config.t_shift,
+                    layer_penalty_factor=generation_config.layer_penalty_factor,
+                    position_temperature=generation_config.position_temperature,
+                    class_temperature=generation_config.class_temperature,
                     denoise=generation_config.denoise,
+                    audio_chunk_duration=generation_config.audio_chunk_duration,
+                    audio_chunk_threshold=generation_config.audio_chunk_threshold,
+                    lane=lane,
                 )
-                for i in range(prepared_task.batch_size)
-            ]
-            short_idx, long_idx = prepared_task.get_indices(
-                generation_config,
-                self.model.audio_tokenizer.config.frame_rate,
-            )
-            if short_idx:
-                lane = "short_mixed"
-            elif prepared_task.ref_audio_tokens[0] is not None:
-                lane = "long_ref"
-            else:
-                lane = "long_no_ref"
-            assert not (
-                short_idx and long_idx
-            ), "Single request should map to one batching lane"
-
-            batch_key = GenerationBatchKey(
-                num_step=generation_config.num_step,
-                guidance_scale=generation_config.guidance_scale,
-                t_shift=generation_config.t_shift,
-                layer_penalty_factor=generation_config.layer_penalty_factor,
-                position_temperature=generation_config.position_temperature,
-                class_temperature=generation_config.class_temperature,
-                denoise=generation_config.denoise,
-                audio_chunk_duration=generation_config.audio_chunk_duration,
-                audio_chunk_threshold=generation_config.audio_chunk_threshold,
-                lane=lane,
-            )
 
             batch_result = self.generation_batcher.submit(
                 PendingGeneration(
@@ -566,13 +619,19 @@ class GenerationService:
             batch_max_sequence_length = batch_result.batch_max_sequence_length
             estimated_batch_memory_mb = batch_result.estimated_batch_memory_mb
             gpu_metrics = batch_result.gpu_metrics
+            batch_stage_timings_ms = dict(batch_result.stage_timings_ms)
 
             audio_duration = (
                 batch_result.audios[0].shape[-1] / self.model.sampling_rate
             )
-            wav_bytes = _audio_to_wav_bytes(
-                batch_result.audios[0], self.model.sampling_rate
-            )
+            with timed_stage(
+                request_stage_timings_ms,
+                "wav_serialize_ms",
+                "omnivoice.service.wav_serialize",
+            ):
+                wav_bytes = _audio_to_wav_bytes(
+                    batch_result.audios[0], self.model.sampling_rate
+                )
             latency_ms = (time.perf_counter() - request_started) * 1000.0
             rtf = (
                 (latency_ms / 1000.0) / audio_duration
@@ -598,6 +657,10 @@ class GenerationService:
                 "X-OmniVoice-Worker-Id": self.worker_id,
                 "X-OmniVoice-Worker-Pid": str(self.worker_pid),
             }
+            if clone_prompt_cache_hit is not None:
+                headers["X-OmniVoice-Clone-Prompt-Cache-Hit"] = (
+                    "true" if clone_prompt_cache_hit else "false"
+                )
             if estimated_batch_memory_mb is not None:
                 headers["X-OmniVoice-Batch-Estimated-Memory-Mb"] = (
                     f"{estimated_batch_memory_mb:.2f}"
@@ -641,16 +704,23 @@ class GenerationService:
             if rtf is not None:
                 headers["X-OmniVoice-RTF"] = f"{rtf:.4f}"
             if self.save_dir is not None:
-                saved_path = _persist_wav_bytes(
-                    wav_bytes=wav_bytes,
-                    save_dir=self.save_dir,
-                    mode=request.mode,
-                    text=cleaned_text,
-                )
+                with timed_stage(
+                    request_stage_timings_ms,
+                    "persist_wav_ms",
+                    "omnivoice.service.persist_wav",
+                ):
+                    saved_path = _persist_wav_bytes(
+                        wav_bytes=wav_bytes,
+                        save_dir=self.save_dir,
+                        mode=request.mode,
+                        text=cleaned_text,
+                    )
                 headers["X-OmniVoice-Saved-Path"] = str(saved_path)
+            _apply_timing_headers(headers, request_stage_timings_ms)
+            _apply_timing_headers(headers, batch_stage_timings_ms)
 
             logger.info(
-                "[%s] request_id=%s status=success mode=%s started_at=%s finished_at=%s latency_ms=%.2f queue_wait_ms=%.2f batch_exec_ms=%.2f batch_requests=%s batch_prompts=%s batch_est_mem_mb=%s gpu_peak_util_pct=%s gpu_peak_used_mb=%s torch_peak_alloc_mb=%s torch_peak_reserved_mb=%s lane=%s audio_s=%.3f rtf=%s text_chars=%d has_ref_audio=%s language=%s device=%s saved_path=%s",
+                "[%s] request_id=%s status=success mode=%s started_at=%s finished_at=%s latency_ms=%.2f queue_wait_ms=%.2f batch_exec_ms=%.2f batch_requests=%s batch_prompts=%s batch_est_mem_mb=%s gpu_peak_util_pct=%s gpu_peak_used_mb=%s torch_peak_alloc_mb=%s torch_peak_reserved_mb=%s lane=%s audio_s=%.3f rtf=%s text_chars=%d has_ref_audio=%s language=%s device=%s clone_prompt_cache_hit=%s request_stage_timings_ms=%s batch_stage_timings_ms=%s saved_path=%s",
                 self.service_label,
                 request.request_id,
                 request.mode,
@@ -691,6 +761,15 @@ class GenerationService:
                 request.ref_audio_bytes is not None,
                 cleaned_language or "auto",
                 self.device,
+                clone_prompt_cache_hit,
+                {
+                    key: round(value, 2)
+                    for key, value in sorted(request_stage_timings_ms.items())
+                },
+                {
+                    key: round(value, 2)
+                    for key, value in sorted(batch_stage_timings_ms.items())
+                },
                 str(saved_path) if saved_path else "-",
             )
 
