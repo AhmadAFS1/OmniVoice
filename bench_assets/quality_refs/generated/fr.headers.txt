@@ -1,0 +1,49 @@
+HTTP/1.1 200 OK
+date: Wed, 15 Apr 2026 15:49:01 GMT
+server: uvicorn
+content-disposition: inline; filename="omnivoice.wav"
+x-omnivoice-request-id: b35a3e213a06
+x-omnivoice-started-at: 2026-04-15T15:49:01.710Z
+x-omnivoice-finished-at: 2026-04-15T15:49:02.281Z
+x-omnivoice-latency-ms: 570.35
+x-omnivoice-audio-duration-s: 4.200
+x-omnivoice-queue-wait-ms: 10.29
+x-omnivoice-batch-exec-ms: 555.59
+x-omnivoice-batch-requests: 1
+x-omnivoice-batch-prompts: 1
+x-omnivoice-batch-target-tokens: 100
+x-omnivoice-batch-max-sequence-length: 131
+x-omnivoice-worker-id: direct
+x-omnivoice-worker-pid: 122
+x-omnivoice-batch-estimated-memory-mb: 21.91
+x-omnivoice-gpu-utilization-peak-pct: 43.00
+x-omnivoice-gpu-memory-total-mb: 24576.00
+x-omnivoice-gpu-memory-used-peak-mb: 3943.00
+x-omnivoice-gpu-memory-free-before-mb: 20204.00
+x-omnivoice-gpu-memory-free-after-mb: 20192.00
+x-omnivoice-gpu-allocator-allocated-mb: 3488.13
+x-omnivoice-gpu-allocator-reserved-mb: 3610.00
+x-omnivoice-gpu-allocator-peak-allocated-mb: 3544.50
+x-omnivoice-gpu-allocator-peak-reserved-mb: 3610.00
+x-omnivoice-rtf: 0.1358
+x-omnivoice-timing-estimate-sequence-ms: 0.85
+x-omnivoice-timing-prepare-task-ms: 0.26
+x-omnivoice-timing-request-prep-ms: 1.21
+x-omnivoice-timing-request-validation-ms: 0.01
+x-omnivoice-timing-wav-serialize-ms: 2.38
+x-omnivoice-timing-batch-decode-tokens-ms: 15.95
+x-omnivoice-timing-batch-generate-tokens-ms: 539.01
+x-omnivoice-timing-batch-merge-task-ms: 0.02
+x-omnivoice-timing-model-decode-tokens-grouped-decode-ms: 9.26
+x-omnivoice-timing-model-decode-tokens-postprocess-ms: 6.60
+x-omnivoice-timing-model-decode-tokens-total-ms: 15.91
+x-omnivoice-timing-model-generate-tokens-short-iterative-ms: 535.76
+x-omnivoice-timing-model-generate-tokens-total-ms: 535.85
+x-omnivoice-timing-model-iterative-forward-ms: 526.56
+x-omnivoice-timing-model-iterative-scoring-ms: 5.06
+x-omnivoice-timing-model-iterative-setup-ms: 1.28
+x-omnivoice-timing-model-iterative-total-ms: 535.74
+x-omnivoice-timing-model-iterative-update-ms: 2.59
+content-length: 201644
+content-type: audio/wav
+

@@ -1,0 +1,98 @@
+{
+  "base_url": "http://127.0.0.1:8002",
+  "num_step": 16,
+  "guidance_scale": 2.0,
+  "duration": 4.0,
+  "items": [
+    {
+      "id": "en",
+      "language": "English",
+      "instruct": "female, low pitch",
+      "text": "Good morning. This is our English reference sentence for checking voice quality.",
+      "wav_path": "bench_assets/quality_refs/generated/en.wav",
+      "headers_path": "bench_assets/quality_refs/generated/en.headers.txt",
+      "text_path": "bench_assets/quality_refs/generated/en.txt",
+      "http_status": 200
+    },
+    {
+      "id": "es",
+      "language": "Spanish",
+      "instruct": "female, low pitch",
+      "text": "Buenos dias. Esta es nuestra frase de referencia en espanol para evaluar la calidad de la voz.",
+      "wav_path": "bench_assets/quality_refs/generated/es.wav",
+      "headers_path": "bench_assets/quality_refs/generated/es.headers.txt",
+      "text_path": "bench_assets/quality_refs/generated/es.txt",
+      "http_status": 200
+    },
+    {
+      "id": "fr",
+      "language": "French",
+      "instruct": "female, low pitch",
+      "text": "Bonjour. Voici notre phrase de reference en francais pour verifier la qualite de la voix.",
+      "wav_path": "bench_assets/quality_refs/generated/fr.wav",
+      "headers_path": "bench_assets/quality_refs/generated/fr.headers.txt",
+      "text_path": "bench_assets/quality_refs/generated/fr.txt",
+      "http_status": 200
+    },
+    {
+      "id": "de",
+      "language": "German",
+      "instruct": "female, low pitch",
+      "text": "Guten Morgen. Dies ist unser deutscher Referenzsatz zur Pruefung der Sprachqualitaet.",
+      "wav_path": "bench_assets/quality_refs/generated/de.wav",
+      "headers_path": "bench_assets/quality_refs/generated/de.headers.txt",
+      "text_path": "bench_assets/quality_refs/generated/de.txt",
+      "http_status": 200
+    },
+    {
+      "id": "pt",
+      "language": "Portuguese",
+      "instruct": "female, low pitch",
+      "text": "Bom dia. Esta e a nossa frase de referencia em portugues para avaliar a qualidade da voz.",
+      "wav_path": "bench_assets/quality_refs/generated/pt.wav",
+      "headers_path": "bench_assets/quality_refs/generated/pt.headers.txt",
+      "text_path": "bench_assets/quality_refs/generated/pt.txt",
+      "http_status": 200
+    },
+    {
+      "id": "zh",
+      "language": "Chinese",
+      "instruct": "female, low pitch",
+      "text": "早上好。这是我们的中文参考句子，用来检查语音质量。",
+      "wav_path": "bench_assets/quality_refs/generated/zh.wav",
+      "headers_path": "bench_assets/quality_refs/generated/zh.headers.txt",
+      "text_path": "bench_assets/quality_refs/generated/zh.txt",
+      "http_status": 200
+    },
+    {
+      "id": "ja",
+      "language": "Japanese",
+      "instruct": "female, low pitch",
+      "text": "おはようございます。これは音声品質を確認するための日本語の基準文です。",
+      "wav_path": "bench_assets/quality_refs/generated/ja.wav",
+      "headers_path": "bench_assets/quality_refs/generated/ja.headers.txt",
+      "text_path": "bench_assets/quality_refs/generated/ja.txt",
+      "http_status": 200
+    },
+    {
+      "id": "ar",
+      "language": "Arabic",
+      "instruct": "female, low pitch",
+      "text": "صباح الخير. هذه جملة مرجعية عربية لاختبار جودة الصوت.",
+      "wav_path": "bench_assets/quality_refs/generated/ar.wav",
+      "headers_path": "bench_assets/quality_refs/generated/ar.headers.txt",
+      "text_path": "bench_assets/quality_refs/generated/ar.txt",
+      "http_status": 200
+    },
+    {
+      "id": "hi",
+      "language": "Hindi",
+      "instruct": "female, low pitch",
+      "text": "नमस्ते। यह आवाज़ की गुणवत्ता जांचने के लिए हमारी हिन्दी संदर्भ पंक्ति है।",
+      "wav_path": "bench_assets/quality_refs/generated/hi.wav",
+      "headers_path": "bench_assets/quality_refs/generated/hi.headers.txt",
+      "text_path": "bench_assets/quality_refs/generated/hi.txt",
+      "http_status": 200
+    }
+  ]
+}
