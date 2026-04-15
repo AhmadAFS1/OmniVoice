@@ -394,12 +394,24 @@ class OmniVoice(PreTrainedModel):
                 device=inputs_embeds.device,
             )
 
-        llm_outputs = self.llm(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            return_dict=True,
-            position_ids=position_ids,
-        )
+        uses_block_mask = attention_mask is not None and type(attention_mask).__name__ == "BlockMask"
+        original_attn_implementation = getattr(self.llm.config, "_attn_implementation", None)
+
+        if uses_block_mask and original_attn_implementation != "flex_attention":
+            self.llm.config._attn_implementation = "flex_attention"
+            self.config._attn_implementation = "flex_attention"
+
+        try:
+            llm_outputs = self.llm(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                return_dict=True,
+                position_ids=position_ids,
+            )
+        finally:
+            if uses_block_mask and original_attn_implementation != "flex_attention":
+                self.llm.config._attn_implementation = original_attn_implementation
+                self.config._attn_implementation = original_attn_implementation
         hidden_states = llm_outputs[0]
 
         loss = None
@@ -1518,9 +1530,20 @@ class OmniVoice(PreTrainedModel):
                 batch_audio_mask = torch.zeros(
                     (2 * B, max_c_len), dtype=torch.bool, device=self.device
                 )
-                batch_attention_mask = torch.zeros(
-                    (2 * B, 1, max_c_len, max_c_len),
+                active_lengths = torch.tensor(
+                    c_lens + task.target_lens,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                pad_self_mask = torch.tensor(
+                    [False] * B + [True] * B,
                     dtype=torch.bool,
+                    device=self.device,
+                )
+                batch_attention_mask = _create_inference_block_mask(
+                    active_lengths=active_lengths,
+                    pad_self_mask=pad_self_mask,
+                    seq_len=max_c_len,
                     device=self.device,
                 )
 
@@ -1530,15 +1553,10 @@ class OmniVoice(PreTrainedModel):
                     # Cond (0 ~ B-1)
                     batch_input_ids[i, :, :c_len] = inp["input_ids"]
                     batch_audio_mask[i, :c_len] = inp["audio_mask"]
-                    batch_attention_mask[i, :, :c_len, :c_len] = True
 
                     # Uncond (B ~ 2B-1)
                     batch_input_ids[B + i, :, :u_len] = inp["input_ids"][..., -u_len:]
                     batch_audio_mask[B + i, :u_len] = inp["audio_mask"][..., -u_len:]
-                    batch_attention_mask[B + i, :, :u_len, :u_len] = True
-                    if max_c_len > u_len:
-                        pad_diag = torch.arange(u_len, max_c_len, device=self.device)
-                        batch_attention_mask[B + i, :, pad_diag, pad_diag] = True
 
                 tokens = torch.full(
                     (B, self.config.num_audio_codebook, max(task.target_lens)),
@@ -1681,6 +1699,34 @@ def _mask_mod_packed(document_ids, b, h, q_idx, kv_idx):
     # (if handled correctly) or be ignored.
     same_doc = document_ids[q_idx] == document_ids[kv_idx]
     return same_doc
+
+
+def _create_inference_block_mask(
+    active_lengths: torch.Tensor,
+    pad_self_mask: torch.Tensor,
+    seq_len: int,
+    device: torch.device,
+):
+    return create_block_mask(
+        _get_inference_mask(active_lengths, pad_self_mask),
+        B=active_lengths.size(0),
+        H=None,
+        Q_LEN=seq_len,
+        KV_LEN=seq_len,
+        _compile=True,
+        device=device,
+    )
+
+
+def _get_inference_mask(active_lengths: torch.Tensor, pad_self_mask: torch.Tensor):
+    return partial(_mask_mod_inference, active_lengths, pad_self_mask)
+
+
+def _mask_mod_inference(active_lengths, pad_self_mask, b, h, q_idx, kv_idx):
+    active = active_lengths[b]
+    within_active = (q_idx < active) & (kv_idx < active)
+    pad_diag = pad_self_mask[b] & (q_idx == kv_idx) & (q_idx >= active)
+    return within_active | pad_diag
 
 
 def _resolve_language(language: Optional[str]) -> Union[str, None]:

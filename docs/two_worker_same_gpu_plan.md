@@ -1030,6 +1030,18 @@ Goal:
 
 - remove the `S^2` dense attention-mask materialization from the iterative path
 
+Status:
+
+- implemented on this branch
+- `_generate_iterative(...)` now builds a batch-aware `BlockMask` once during
+  setup instead of allocating a dense `[2B, 1, S, S]` bool tensor
+- the new mask preserves the previous inference semantics:
+  - conditional rows attend within their active prefix only
+  - unconditional rows attend within their active prefix and keep pad-diagonal
+    self-attention for the padded tail
+- this is an inference-specific mask path and does not change the existing
+  packed-training `document_ids` path in `forward(...)`
+
 Work items:
 
 - refactor `_generate_iterative(...)` to use packed or block-mask metadata

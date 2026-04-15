@@ -27,6 +27,8 @@ examples/download*
 examples/exp*/
 .claude/
 *.wav
+!bench_assets/generated_ref.wav
+!bench_assets/quality_refs/generated/*.wav
 *.jsonl
 
 # API server / benchmark artifacts
