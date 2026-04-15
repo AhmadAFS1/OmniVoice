@@ -1518,7 +1518,14 @@ class OmniVoice(PreTrainedModel):
                 ]
 
                 c_lens = [inp["input_ids"].size(2) for inp in inputs_list]
+                c_lens_tensor = torch.tensor(
+                    c_lens, dtype=torch.long, device=self.device
+                )
+                target_lens_tensor = torch.tensor(
+                    task.target_lens, dtype=torch.long, device=self.device
+                )
                 max_c_len = max(c_lens)
+                max_target_len = int(target_lens_tensor.max().item())
                 pad_id = self.config.audio_mask_id  # Or any other tokens
 
                 batch_input_ids = torch.full(
@@ -1559,7 +1566,7 @@ class OmniVoice(PreTrainedModel):
                     batch_audio_mask[B + i, :u_len] = inp["audio_mask"][..., -u_len:]
 
                 tokens = torch.full(
-                    (B, self.config.num_audio_codebook, max(task.target_lens)),
+                    (B, self.config.num_audio_codebook, max_target_len),
                     self.config.audio_mask_id,
                     dtype=torch.long,
                     device=self.device,
@@ -1591,10 +1598,31 @@ class OmniVoice(PreTrainedModel):
                         sched.append(int(num))
                         rem -= int(num)
                     schedules.append(sched)
+                schedule_tensor = torch.tensor(
+                    schedules, dtype=torch.long, device=self.device
+                )
 
                 layer_ids = torch.arange(
                     self.config.num_audio_codebook, device=self.device
                 ).view(1, -1, 1)
+                target_positions = torch.arange(
+                    max_target_len, device=self.device
+                )
+                valid_target_mask = (
+                    target_positions.view(1, 1, -1)
+                    < target_lens_tensor.view(B, 1, 1)
+                )
+                valid_target_mask_bt = valid_target_mask.squeeze(1).unsqueeze(-1)
+                batch_row_idx = torch.arange(B, device=self.device).view(B, 1)
+                cond_target_positions = (
+                    c_lens_tensor.view(B, 1)
+                    - target_lens_tensor.view(B, 1)
+                    + target_positions.view(1, -1)
+                ).clamp_(0, max_c_len - 1)
+                uncond_target_positions = torch.minimum(
+                    target_positions.view(1, -1),
+                    (target_lens_tensor - 1).clamp_min(0).view(B, 1),
+                )
 
             for step in range(gen_config.num_step):
                 with timed_stage(
@@ -1608,53 +1636,79 @@ class OmniVoice(PreTrainedModel):
                         attention_mask=batch_attention_mask,
                     ).logits.to(torch.float32)
 
-                for i in range(B):
-                    k = schedules[i][step]
-                    if k <= 0:
-                        continue
+                scoring_started = time.perf_counter()
+                cond_logits = (
+                    batch_logits[:B]
+                    .permute(0, 2, 1, 3)[batch_row_idx, cond_target_positions]
+                    .permute(0, 2, 1, 3)
+                    .contiguous()
+                )
+                u_logits = (
+                    batch_logits[B:]
+                    .permute(0, 2, 1, 3)[batch_row_idx, uncond_target_positions]
+                    .permute(0, 2, 1, 3)
+                    .contiguous()
+                )
 
-                    c_len, t_len = c_lens[i], task.target_lens[i]
+                pred_tokens, scores = self._predict_tokens_with_scoring(
+                    cond_logits, u_logits, gen_config
+                )
 
-                    scoring_started = time.perf_counter()
-                    # Extract real target Logits
-                    # [1, C, T, V]
-                    c_logits = batch_logits[i : i + 1, :, c_len - t_len : c_len, :]
-                    u_logits = batch_logits[B + i : B + i + 1, :, :t_len, :]
+                scores = scores - (layer_ids * gen_config.layer_penalty_factor)
 
-                    pred_tokens, scores = self._predict_tokens_with_scoring(
-                        c_logits, u_logits, gen_config
+                if gen_config.position_temperature > 0.0:
+                    scores = _gumbel_sample(scores, gen_config.position_temperature)
+
+                scores.masked_fill_(~valid_target_mask, -float("inf"))
+                scores.masked_fill_(tokens != self.config.audio_mask_id, -float("inf"))
+                add_timing(
+                    _profile,
+                    "model_iterative_scoring_ms",
+                    (time.perf_counter() - scoring_started) * 1000.0,
+                )
+
+                update_started = time.perf_counter()
+                step_ks = schedule_tensor[:, step]
+                max_step_k = int(step_ks.max().item())
+                if max_step_k > 0:
+                    flat_scores = scores.reshape(B, -1)
+                    flat_pred_tokens = pred_tokens.reshape(B, -1)
+                    flat_tokens = tokens.reshape(B, -1)
+
+                    _, topk_idx = torch.topk(flat_scores, k=max_step_k, dim=1)
+                    active_topk_mask = (
+                        torch.arange(max_step_k, device=self.device).view(1, -1)
+                        < step_ks.view(B, 1)
+                    )
+                    update_mask = torch.zeros_like(flat_scores, dtype=torch.bool)
+                    update_mask.scatter_(1, topk_idx, active_topk_mask)
+                    flat_tokens = torch.where(
+                        update_mask,
+                        flat_pred_tokens,
+                        flat_tokens,
+                    )
+                    tokens = flat_tokens.view_as(tokens)
+
+                    uncond_inputs = batch_input_ids[B:, :, :max_target_len]
+                    batch_input_ids[B:, :, :max_target_len] = torch.where(
+                        valid_target_mask,
+                        tokens,
+                        uncond_inputs,
                     )
 
-                    scores = scores - (layer_ids * gen_config.layer_penalty_factor)
-
-                    if gen_config.position_temperature > 0.0:
-                        scores = _gumbel_sample(scores, gen_config.position_temperature)
-                    add_timing(
-                        _profile,
-                        "model_iterative_scoring_ms",
-                        (time.perf_counter() - scoring_started) * 1000.0,
+                    cond_view = batch_input_ids[:B].permute(0, 2, 1)
+                    token_view = tokens.permute(0, 2, 1)
+                    current_cond = cond_view[batch_row_idx, cond_target_positions]
+                    cond_view[batch_row_idx, cond_target_positions] = torch.where(
+                        valid_target_mask_bt,
+                        token_view,
+                        current_cond,
                     )
-
-                    update_started = time.perf_counter()
-                    sample_tokens = tokens[i : i + 1, :, :t_len]
-                    scores.masked_fill_(
-                        sample_tokens != self.config.audio_mask_id, -float("inf")
-                    )
-
-                    _, topk_idx = torch.topk(scores.flatten(), k)
-                    flat_tokens = sample_tokens.flatten()
-                    flat_tokens[topk_idx] = pred_tokens.flatten()[topk_idx]
-                    sample_tokens.copy_(flat_tokens.view_as(sample_tokens))
-
-                    # Update individual slices into batched structure
-                    tokens[i : i + 1, :, :t_len] = sample_tokens
-                    batch_input_ids[i : i + 1, :, c_len - t_len : c_len] = sample_tokens
-                    batch_input_ids[B + i : B + i + 1, :, :t_len] = sample_tokens
-                    add_timing(
-                        _profile,
-                        "model_iterative_update_ms",
-                        (time.perf_counter() - update_started) * 1000.0,
-                    )
+                add_timing(
+                    _profile,
+                    "model_iterative_update_ms",
+                    (time.perf_counter() - update_started) * 1000.0,
+                )
 
             return [tokens[i, :, : task.target_lens[i]] for i in range(B)]
 

@@ -288,6 +288,61 @@ Why this does **not** end the optimization work:
   - CUDA Graphs
   - Triton fused kernels
 
+### Phase 2 Result: Dense Mask Elimination With Flex Attention
+
+Phase 2 replaced the dense iterative attention mask with a batch-aware
+`BlockMask`. Because Qwen3 was still using the `sdpa` attention backend, the
+model path was also updated to switch to `flex_attention` whenever a
+`BlockMask` is passed into `forward(...)`.
+
+That change introduced a very important operational behavior:
+
+- the **first** large benchmark after server startup pays a significant compile
+  and warmup cost
+- subsequent runs are materially faster
+- to avoid exposing that cold-start penalty to real traffic, the worker startup
+  path now runs a synthetic CUDA warmup batch that compiles the
+  `flex_attention` path before the worker is marked ready
+
+Benchmark command used for both measurements:
+
+```bash
+.venv/bin/python scripts/benchmark_api_batching.py \
+  --url http://127.0.0.1:8002/generate \
+  --requests 100 \
+  --concurrency 100 \
+  --launch-window-s 2 \
+  --mode design \
+  --num-step 16 \
+  --guidance-scale 2.0 \
+  --duration 4.0
+```
+
+Observed benchmark summary:
+
+| Metric | Pre-Phase-2 Baseline | Phase-2 Cold Run | Phase-2 Warm Run |
+|---|---:|---:|---:|
+| Total wall time | `17.36s` | `31.45s` | `15.91s` |
+| Effective throughput | `5.76 req/s` | `3.18 req/s` | `6.29 req/s` |
+| Mean latency | `11487 ms` | `20426 ms` | `9928 ms` |
+| Mean queue wait | `4154 ms` | `15166 ms` | `4093 ms` |
+| Mean batch exec | `7310 ms` | `5222 ms` | `5814 ms` |
+| `model_iterative_forward_ms` mean | `4212 ms` | `2781 ms` | `3378 ms` |
+| `model_iterative_scoring_ms` mean | `1997 ms` | `977 ms` | `1533 ms` |
+| Peak GPU memory used | `~13.3 GB` | `~12.9 GB` | `~15.6 GB` |
+
+Interpretation:
+
+- the cold-run regression was dominated by first-use `flex_attention` compile
+  overhead, not steady-state throughput
+- the warmed Phase 2 path improved steady-state throughput versus the
+  pre-Phase-2 baseline: `5.76 -> 6.29 req/s`
+- warmed mean latency improved as well: `11487 ms -> 9928 ms`
+- the biggest measured win landed in the forward pass:
+  `model_iterative_forward_ms` dropped from `4212 ms` to `3378 ms`
+- this validates the dense-mask removal work, but it also means worker startup
+  warmup is mandatory for production-like behavior
+
 ### What These Results Tell Us
 
 The same-GPU 2-worker implementation is functioning correctly:
@@ -1035,12 +1090,16 @@ Status:
 - implemented on this branch
 - `_generate_iterative(...)` now builds a batch-aware `BlockMask` once during
   setup instead of allocating a dense `[2B, 1, S, S]` bool tensor
+- `forward(...)` now switches to `flex_attention` when a `BlockMask` is used so
+  Qwen3 does not try to route the sparse mask through the `sdpa` backend
 - the new mask preserves the previous inference semantics:
   - conditional rows attend within their active prefix only
   - unconditional rows attend within their active prefix and keep pad-diagonal
     self-attention for the padded tail
 - this is an inference-specific mask path and does not change the existing
   packed-training `document_ids` path in `forward(...)`
+- worker startup now runs a synthetic CUDA warmup batch so the `flex_attention`
+  compile cost is paid before the worker starts serving real requests
 
 Work items:
 
@@ -1137,6 +1196,15 @@ Expected impact:
 Goal:
 
 - remove repeated Python overhead in the scoring and token-update loop
+
+Status:
+
+- implemented early on this branch, ahead of shape bucketing
+- `_generate_iterative(...)` now batches target-logit extraction,
+  `_predict_tokens_with_scoring`, top-k position selection, and conditional /
+  unconditional token writes instead of iterating request-by-request in Python
+- this phase was pulled forward because Phase 0 showed scoring and update logic
+  were the second-largest timed stage after the forward pass
 
 Work items:
 

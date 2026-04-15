@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import io
+import gc
 import logging
 import os
 import tempfile
@@ -29,6 +30,9 @@ from omnivoice.serving.batching import (
 from omnivoice.utils.profiling import timed_stage
 
 logger = logging.getLogger(__name__)
+
+_STARTUP_WARMUP_TEXT = "OmniVoice startup warmup request."
+_STARTUP_WARMUP_INSTRUCT = "female, low pitch, british accent"
 
 
 def get_best_device() -> str:
@@ -181,6 +185,11 @@ class GenerationServiceConfig:
     gpu_memory_utilization: float = 0.85
     gpu_memory_reserve_mb: int = 1024
     max_estimated_batch_memory_mb: Optional[int] = None
+    startup_warmup_enabled: bool = True
+    startup_warmup_batch_size: int = 4
+    startup_warmup_num_step: int = 16
+    startup_warmup_guidance_scale: float = 2.0
+    startup_warmup_duration: float = 4.0
 
 
 @dataclass(frozen=True)
@@ -326,6 +335,8 @@ class GenerationService:
             config=self.batch_config,
             name=f"omnivoice-batcher-{self.service_label}",
         )
+        if self._should_run_startup_warmup():
+            self._run_startup_warmup()
         logger.info(
             "[%s] Model loaded. Sampling rate=%s",
             self.service_label,
@@ -334,6 +345,71 @@ class GenerationService:
 
     def close(self) -> None:
         self.generation_batcher.close()
+
+    def _should_run_startup_warmup(self) -> bool:
+        if not self.config.startup_warmup_enabled:
+            return False
+        if not str(self.device).startswith("cuda"):
+            return False
+        if (
+            self.config.coreml_backbone
+            or self.config.coreml_decoder
+            or self.config.onnx_backbone
+            or self.config.onnx_decoder
+        ):
+            return False
+        return True
+
+    def _run_startup_warmup(self) -> None:
+        warmup_batch_size = max(
+            1,
+            min(
+                int(self.config.startup_warmup_batch_size),
+                self.batch_config.max_batch_requests,
+                self.batch_config.max_batch_prompts,
+            ),
+        )
+        warmup_duration = max(0.1, float(self.config.startup_warmup_duration))
+        warmup_num_step = max(1, int(self.config.startup_warmup_num_step))
+        warmup_guidance = float(self.config.startup_warmup_guidance_scale)
+        warmup_texts = [_STARTUP_WARMUP_TEXT] * warmup_batch_size
+        warmup_instructs = [_STARTUP_WARMUP_INSTRUCT] * warmup_batch_size
+        warmup_config = OmniVoiceGenerationConfig(
+            num_step=warmup_num_step,
+            guidance_scale=warmup_guidance,
+            denoise=True,
+            preprocess_prompt=True,
+            postprocess_output=False,
+        )
+
+        logger.info(
+            "[%s] Running startup warmup batch_size=%d num_step=%d guidance_scale=%.2f duration=%.2f",
+            self.service_label,
+            warmup_batch_size,
+            warmup_num_step,
+            warmup_guidance,
+            warmup_duration,
+        )
+        started = time.perf_counter()
+        warmup_task = self.model.prepare_generation_task(
+            text=warmup_texts,
+            instruct=warmup_instructs,
+            preprocess_prompt=warmup_config.preprocess_prompt,
+            duration=[warmup_duration] * warmup_batch_size,
+        )
+        self.model.generate_tokens(
+            warmup_task,
+            generation_config=warmup_config,
+        )
+        if torch.cuda.is_available() and str(self.device).startswith("cuda"):
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
+        logger.info(
+            "[%s] Startup warmup complete in %.2fs",
+            self.service_label,
+            time.perf_counter() - started,
+        )
 
     def health(self) -> dict[str, Any]:
         coreml_backbone_runtime = getattr(self.model, "_coreml_backbone", None)

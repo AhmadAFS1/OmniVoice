@@ -223,6 +223,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional hard cap for estimated incremental batch memory. Overrides automatic CUDA-based budgeting when set.",
     )
+    parser.add_argument(
+        "--no-startup-warmup",
+        action="store_true",
+        default=False,
+        help="Skip the CUDA startup warmup batch that precompiles the flex_attention path.",
+    )
+    parser.add_argument(
+        "--startup-warmup-batch-size",
+        type=int,
+        default=4,
+        help="Synthetic batch size to use for CUDA startup warmup.",
+    )
     return parser
 
 
@@ -251,6 +263,8 @@ def _build_service_config(
     gpu_memory_utilization: float,
     gpu_memory_reserve_mb: int,
     max_estimated_batch_memory_mb: Optional[int],
+    startup_warmup_enabled: bool,
+    startup_warmup_batch_size: int,
 ) -> GenerationServiceConfig:
     return GenerationServiceConfig(
         model_checkpoint=model_checkpoint,
@@ -277,6 +291,8 @@ def _build_service_config(
         gpu_memory_utilization=gpu_memory_utilization,
         gpu_memory_reserve_mb=gpu_memory_reserve_mb,
         max_estimated_batch_memory_mb=max_estimated_batch_memory_mb,
+        startup_warmup_enabled=startup_warmup_enabled,
+        startup_warmup_batch_size=startup_warmup_batch_size,
     )
 
 
@@ -307,6 +323,8 @@ def create_app(
     gpu_memory_utilization: float = 0.85,
     gpu_memory_reserve_mb: int = 1024,
     max_estimated_batch_memory_mb: Optional[int] = None,
+    startup_warmup_enabled: bool = True,
+    startup_warmup_batch_size: int = 4,
 ) -> FastAPI:
     resolved_device = device or get_best_device()
     if same_gpu_workers < 1:
@@ -341,6 +359,8 @@ def create_app(
         gpu_memory_utilization=gpu_memory_utilization,
         gpu_memory_reserve_mb=gpu_memory_reserve_mb,
         max_estimated_batch_memory_mb=max_estimated_batch_memory_mb,
+        startup_warmup_enabled=startup_warmup_enabled,
+        startup_warmup_batch_size=startup_warmup_batch_size,
     )
 
     if same_gpu_workers > 1:
@@ -518,6 +538,8 @@ def main() -> None:
         gpu_memory_utilization=args.gpu_memory_utilization,
         gpu_memory_reserve_mb=args.gpu_memory_reserve_mb,
         max_estimated_batch_memory_mb=args.max_estimated_batch_memory_mb,
+        startup_warmup_enabled=not args.no_startup_warmup,
+        startup_warmup_batch_size=args.startup_warmup_batch_size,
     )
 
     uvicorn.run(
