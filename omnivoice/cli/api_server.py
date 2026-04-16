@@ -170,6 +170,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Micro-batch collection window in milliseconds.",
     )
     parser.add_argument(
+        "--no-shape-bucketing",
+        action="store_true",
+        default=False,
+        help="Disable shape-aware batching buckets and merge only on generation compatibility.",
+    )
+    parser.add_argument(
+        "--shape-bucket-target-tokens",
+        type=int,
+        default=16,
+        help="Target-token bucket size used to group similarly shaped requests.",
+    )
+    parser.add_argument(
+        "--shape-bucket-conditioning-tokens",
+        type=int,
+        default=32,
+        help="Conditioning-length bucket size used to group similarly shaped requests.",
+    )
+    parser.add_argument(
         "--max-batch-requests",
         type=int,
         default=32,
@@ -235,6 +253,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=4,
         help="Synthetic batch size to use for CUDA startup warmup.",
     )
+    parser.add_argument(
+        "--no-cuda-graphs",
+        action="store_true",
+        default=False,
+        help="Disable experimental CUDA Graph replay for repeated homogeneous inference shapes.",
+    )
+    parser.add_argument(
+        "--cuda-graph-min-batch-size",
+        type=int,
+        default=4,
+        help="Minimum merged request count required before attempting CUDA Graph capture.",
+    )
+    parser.add_argument(
+        "--no-triton-score-fusion",
+        action="store_true",
+        default=False,
+        help="Disable the compiled scoring path that relies on Inductor/Triton fusion.",
+    )
     return parser
 
 
@@ -254,6 +290,9 @@ def _build_service_config(
     onnx_decoder_provider: str,
     save_dir: Optional[str],
     batch_collect_ms: float,
+    shape_bucketing_enabled: bool,
+    shape_bucket_target_tokens: int,
+    shape_bucket_conditioning_tokens: int,
     max_batch_requests: int,
     max_batch_prompts: int,
     max_batch_target_tokens: int,
@@ -265,6 +304,9 @@ def _build_service_config(
     max_estimated_batch_memory_mb: Optional[int],
     startup_warmup_enabled: bool,
     startup_warmup_batch_size: int,
+    cuda_graphs_enabled: bool,
+    cuda_graph_min_batch_size: int,
+    triton_score_fusion_enabled: bool,
 ) -> GenerationServiceConfig:
     return GenerationServiceConfig(
         model_checkpoint=model_checkpoint,
@@ -282,6 +324,9 @@ def _build_service_config(
         onnx_decoder_provider=onnx_decoder_provider,
         save_dir=save_dir,
         batch_collect_ms=batch_collect_ms,
+        shape_bucketing_enabled=shape_bucketing_enabled,
+        shape_bucket_target_tokens=shape_bucket_target_tokens,
+        shape_bucket_conditioning_tokens=shape_bucket_conditioning_tokens,
         max_batch_requests=max_batch_requests,
         max_batch_prompts=max_batch_prompts,
         max_batch_target_tokens=max_batch_target_tokens,
@@ -293,6 +338,9 @@ def _build_service_config(
         max_estimated_batch_memory_mb=max_estimated_batch_memory_mb,
         startup_warmup_enabled=startup_warmup_enabled,
         startup_warmup_batch_size=startup_warmup_batch_size,
+        cuda_graphs_enabled=cuda_graphs_enabled,
+        cuda_graph_min_batch_size=cuda_graph_min_batch_size,
+        triton_score_fusion_enabled=triton_score_fusion_enabled,
     )
 
 
@@ -314,6 +362,9 @@ def create_app(
     onnx_decoder_provider: str = "auto",
     save_dir: Optional[str] = None,
     batch_collect_ms: float = 10.0,
+    shape_bucketing_enabled: bool = True,
+    shape_bucket_target_tokens: int = 16,
+    shape_bucket_conditioning_tokens: int = 32,
     max_batch_requests: int = 32,
     max_batch_prompts: int = 32,
     max_batch_target_tokens: int = 4096,
@@ -325,6 +376,9 @@ def create_app(
     max_estimated_batch_memory_mb: Optional[int] = None,
     startup_warmup_enabled: bool = True,
     startup_warmup_batch_size: int = 4,
+    cuda_graphs_enabled: bool = True,
+    cuda_graph_min_batch_size: int = 4,
+    triton_score_fusion_enabled: bool = True,
 ) -> FastAPI:
     resolved_device = device or get_best_device()
     if same_gpu_workers < 1:
@@ -350,6 +404,9 @@ def create_app(
         onnx_decoder_provider=onnx_decoder_provider,
         save_dir=save_dir,
         batch_collect_ms=batch_collect_ms,
+        shape_bucketing_enabled=shape_bucketing_enabled,
+        shape_bucket_target_tokens=shape_bucket_target_tokens,
+        shape_bucket_conditioning_tokens=shape_bucket_conditioning_tokens,
         max_batch_requests=max_batch_requests,
         max_batch_prompts=max_batch_prompts,
         max_batch_target_tokens=max_batch_target_tokens,
@@ -361,6 +418,9 @@ def create_app(
         max_estimated_batch_memory_mb=max_estimated_batch_memory_mb,
         startup_warmup_enabled=startup_warmup_enabled,
         startup_warmup_batch_size=startup_warmup_batch_size,
+        cuda_graphs_enabled=cuda_graphs_enabled,
+        cuda_graph_min_batch_size=cuda_graph_min_batch_size,
+        triton_score_fusion_enabled=triton_score_fusion_enabled,
     )
 
     if same_gpu_workers > 1:
@@ -439,6 +499,9 @@ def create_app(
         ref_text: Optional[str] = Form(None),
         num_step: int = Form(32),
         guidance_scale: float = Form(2.0),
+        layer_penalty_factor: float = Form(5.0),
+        position_temperature: float = Form(5.0),
+        class_temperature: float = Form(0.0),
         speed: Optional[float] = Form(None),
         duration: Optional[float] = Form(None),
         denoise: bool = Form(True),
@@ -466,6 +529,9 @@ def create_app(
                     ref_audio_filename=ref_audio_filename,
                     num_step=num_step,
                     guidance_scale=guidance_scale,
+                    layer_penalty_factor=layer_penalty_factor,
+                    position_temperature=position_temperature,
+                    class_temperature=class_temperature,
                     speed=speed,
                     duration=duration,
                     denoise=denoise,
@@ -529,6 +595,9 @@ def main() -> None:
         onnx_decoder_provider=args.onnx_decoder_provider,
         save_dir=args.save_dir,
         batch_collect_ms=args.batch_collect_ms,
+        shape_bucketing_enabled=not args.no_shape_bucketing,
+        shape_bucket_target_tokens=args.shape_bucket_target_tokens,
+        shape_bucket_conditioning_tokens=args.shape_bucket_conditioning_tokens,
         max_batch_requests=args.max_batch_requests,
         max_batch_prompts=args.max_batch_prompts,
         max_batch_target_tokens=args.max_batch_target_tokens,
@@ -540,6 +609,9 @@ def main() -> None:
         max_estimated_batch_memory_mb=args.max_estimated_batch_memory_mb,
         startup_warmup_enabled=not args.no_startup_warmup,
         startup_warmup_batch_size=args.startup_warmup_batch_size,
+        cuda_graphs_enabled=not args.no_cuda_graphs,
+        cuda_graph_min_batch_size=args.cuda_graph_min_batch_size,
+        triton_score_fusion_enabled=not args.no_triton_score_fusion,
     )
 
     uvicorn.run(

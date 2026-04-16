@@ -25,6 +25,8 @@ from omnivoice.serving.batching import (
     GenerationBatcher,
     GenerationBatcherConfig,
     PendingGeneration,
+    build_generation_shape_bucket_id,
+    build_generation_shape_signature,
     build_clone_prompt_cache_key,
 )
 from omnivoice.utils.profiling import timed_stage
@@ -176,6 +178,9 @@ class GenerationServiceConfig:
     onnx_decoder_provider: str = "auto"
     save_dir: Optional[str] = None
     batch_collect_ms: float = 10.0
+    shape_bucketing_enabled: bool = True
+    shape_bucket_target_tokens: int = 16
+    shape_bucket_conditioning_tokens: int = 32
     max_batch_requests: int = 32
     max_batch_prompts: int = 32
     max_batch_target_tokens: int = 4096
@@ -190,6 +195,9 @@ class GenerationServiceConfig:
     startup_warmup_num_step: int = 16
     startup_warmup_guidance_scale: float = 2.0
     startup_warmup_duration: float = 4.0
+    cuda_graphs_enabled: bool = True
+    cuda_graph_min_batch_size: int = 4
+    triton_score_fusion_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -204,6 +212,9 @@ class GenerationRequestPayload:
     ref_audio_filename: Optional[str] = None
     num_step: int = 32
     guidance_scale: float = 2.0
+    layer_penalty_factor: float = 5.0
+    position_temperature: float = 5.0
+    class_temperature: float = 0.0
     speed: Optional[float] = None
     duration: Optional[float] = None
     denoise: bool = True
@@ -310,6 +321,11 @@ class GenerationService:
 
         self.batch_config = GenerationBatcherConfig(
             collect_ms=config.batch_collect_ms,
+            shape_bucketing_enabled=bool(config.shape_bucketing_enabled),
+            shape_bucket_target_tokens=max(1, int(config.shape_bucket_target_tokens)),
+            shape_bucket_conditioning_tokens=max(
+                1, int(config.shape_bucket_conditioning_tokens)
+            ),
             max_batch_requests=max(1, int(config.max_batch_requests)),
             max_batch_prompts=max(1, int(config.max_batch_prompts)),
             max_total_target_tokens=max(1, int(config.max_batch_target_tokens)),
@@ -327,6 +343,19 @@ class GenerationService:
                 else None
             ),
         )
+        set_inference_optimizations = getattr(
+            self.model, "set_inference_optimizations", None
+        )
+        if callable(set_inference_optimizations):
+            set_inference_optimizations(
+                enable_cuda_graphs=bool(config.cuda_graphs_enabled),
+                cuda_graph_min_batch_size=max(
+                    1, int(config.cuda_graph_min_batch_size)
+                ),
+                enable_triton_score_fusion=bool(
+                    config.triton_score_fusion_enabled
+                ),
+            )
         self.clone_prompt_cache = ClonePromptCache(
             max_entries=max(1, int(config.clone_prompt_cache_size))
         )
@@ -501,6 +530,8 @@ class GenerationService:
         estimated_batch_memory_mb = None
         gpu_metrics: dict[str, object] = {}
         lane = None
+        shape_bucket_id: Optional[str] = None
+        exact_shape_homogeneous = False
         request_stage_timings_ms: dict[str, float] = {}
         batch_stage_timings_ms: dict[str, float] = {}
         clone_prompt_cache_hit: Optional[bool] = None
@@ -553,10 +584,21 @@ class GenerationService:
                     generation_config = OmniVoiceGenerationConfig(
                         num_step=int(request.num_step),
                         guidance_scale=float(request.guidance_scale),
+                        layer_penalty_factor=float(request.layer_penalty_factor),
+                        position_temperature=float(request.position_temperature),
+                        class_temperature=float(request.class_temperature),
                         denoise=bool(request.denoise),
                         preprocess_prompt=bool(request.preprocess_prompt),
                         postprocess_output=bool(request.postprocess_output),
                     )
+                    if generation_config.position_temperature < 0:
+                        raise ValueError(
+                            "position_temperature must be greater than or equal to 0."
+                        )
+                    if generation_config.class_temperature < 0:
+                        raise ValueError(
+                            "class_temperature must be greater than or equal to 0."
+                        )
 
                     task_kwargs: dict[str, Any] = {
                         "text": cleaned_text,
@@ -670,6 +712,21 @@ class GenerationService:
                     audio_chunk_threshold=generation_config.audio_chunk_threshold,
                     lane=lane,
                 )
+                if self.batch_config.shape_bucketing_enabled:
+                    shape_bucket_id = build_generation_shape_bucket_id(
+                        lane=lane,
+                        guidance_scale=generation_config.guidance_scale,
+                        prompt_count=prepared_task.batch_size,
+                        estimated_sequence_lengths=estimated_sequence_lengths,
+                        target_lens=prepared_task.target_lens,
+                        conditioning_bucket_tokens=self.batch_config.shape_bucket_conditioning_tokens,
+                        target_bucket_tokens=self.batch_config.shape_bucket_target_tokens,
+                    )
+                exact_shape_signature = build_generation_shape_signature(
+                    prompt_count=prepared_task.batch_size,
+                    estimated_sequence_lengths=estimated_sequence_lengths,
+                    target_lens=prepared_task.target_lens,
+                )
 
             batch_result = self.generation_batcher.submit(
                 PendingGeneration(
@@ -684,11 +741,15 @@ class GenerationService:
                     ]
                     * prepared_task.batch_size,
                     estimated_sequence_lengths=estimated_sequence_lengths,
+                    shape_bucket_id=shape_bucket_id,
+                    exact_shape_signature=exact_shape_signature,
                 )
             )
 
             queue_wait_ms = batch_result.queue_wait_ms
             batch_exec_ms = batch_result.batch_exec_ms
+            shape_bucket_id = batch_result.shape_bucket_id
+            exact_shape_homogeneous = batch_result.exact_shape_homogeneous
             batch_requests = batch_result.batch_requests
             batch_prompts = batch_result.batch_prompts
             batch_target_tokens = batch_result.batch_target_tokens
@@ -733,6 +794,11 @@ class GenerationService:
                 "X-OmniVoice-Worker-Id": self.worker_id,
                 "X-OmniVoice-Worker-Pid": str(self.worker_pid),
             }
+            if shape_bucket_id is not None:
+                headers["X-OmniVoice-Shape-Bucket"] = shape_bucket_id
+            headers["X-OmniVoice-Exact-Shape-Homogeneous"] = (
+                "true" if exact_shape_homogeneous else "false"
+            )
             if clone_prompt_cache_hit is not None:
                 headers["X-OmniVoice-Clone-Prompt-Cache-Hit"] = (
                     "true" if clone_prompt_cache_hit else "false"
@@ -796,7 +862,7 @@ class GenerationService:
             _apply_timing_headers(headers, batch_stage_timings_ms)
 
             logger.info(
-                "[%s] request_id=%s status=success mode=%s started_at=%s finished_at=%s latency_ms=%.2f queue_wait_ms=%.2f batch_exec_ms=%.2f batch_requests=%s batch_prompts=%s batch_est_mem_mb=%s gpu_peak_util_pct=%s gpu_peak_used_mb=%s torch_peak_alloc_mb=%s torch_peak_reserved_mb=%s lane=%s audio_s=%.3f rtf=%s text_chars=%d has_ref_audio=%s language=%s device=%s clone_prompt_cache_hit=%s request_stage_timings_ms=%s batch_stage_timings_ms=%s saved_path=%s",
+                "[%s] request_id=%s status=success mode=%s started_at=%s finished_at=%s latency_ms=%.2f queue_wait_ms=%.2f batch_exec_ms=%.2f batch_requests=%s batch_prompts=%s batch_est_mem_mb=%s gpu_peak_util_pct=%s gpu_peak_used_mb=%s torch_peak_alloc_mb=%s torch_peak_reserved_mb=%s lane=%s shape_bucket=%s exact_shape_homogeneous=%s audio_s=%.3f rtf=%s text_chars=%d has_ref_audio=%s language=%s device=%s clone_prompt_cache_hit=%s request_stage_timings_ms=%s batch_stage_timings_ms=%s saved_path=%s",
                 self.service_label,
                 request.request_id,
                 request.mode,
@@ -831,6 +897,8 @@ class GenerationService:
                     else "n/a"
                 ),
                 lane,
+                shape_bucket_id,
+                exact_shape_homogeneous,
                 audio_duration,
                 f"{rtf:.4f}" if rtf is not None else "n/a",
                 len(cleaned_text),

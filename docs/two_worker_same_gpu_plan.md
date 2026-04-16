@@ -343,6 +343,79 @@ Interpretation:
 - this validates the dense-mask removal work, but it also means worker startup
   warmup is mandatory for production-like behavior
 
+### Phase 3-5 Result: Shape Bucketing, Exact-Shape CUDA Graphs, And Triton Groundwork
+
+The next implementation slice added three connected changes:
+
+- Phase 3 shape bucketing in the batcher, with an exact-shape-first selection
+  pass and a coarse bucket fallback pass
+- Phase 4 experimental CUDA Graph replay for homogeneous exact-shape batches
+- Phase 5 low-risk Triton groundwork by compiling the scoring path with
+  Inductor/Triton when possible, but automatically falling back to eager
+  execution if that path fails at runtime
+
+Benchmark command:
+
+```bash
+.venv/bin/python scripts/benchmark_api_batching.py \
+  --url http://127.0.0.1:8002/generate \
+  --requests 100 \
+  --concurrency 100 \
+  --launch-window-s 2 \
+  --mode design \
+  --num-step 16 \
+  --guidance-scale 2.0 \
+  --duration 4.0
+```
+
+Observed benchmark summary:
+
+| Metric | Clean Pre-Phase-3 Baseline | Phase 3-5 Run |
+|---|---:|---:|
+| Total wall time | `20.62s` | `19.18s` |
+| Effective throughput | `4.85 req/s` | `5.21 req/s` |
+| Mean latency | `14734 ms` | `12022 ms` |
+| Mean queue wait | `6745 ms` | `6883 ms` |
+| Mean batch exec | `7953 ms` | `5108 ms` |
+| `model_iterative_forward_ms` mean | `2801 ms` | `1493 ms` |
+| `model_iterative_update_ms` mean | `3861 ms` | `2661 ms` |
+| Peak GPU memory used | `~13.0 GB` | `~13.7 GB` |
+
+Additional Phase 3-5 telemetry from the validated run:
+
+- shape bucket distribution:
+  - `short_mixed|cfg|p1|t112|c128 => 83`
+  - `short_mixed|cfg|p1|t112|c160 => 17`
+- exact-shape homogeneous responses: `true => 18`, `false => 82`
+- CUDA Graph telemetry appeared in live responses for homogeneous batches:
+  - `model_iterative_graph_capture_ms mean ~= 944 ms`
+  - `model_iterative_graph_replay_ms mean ~= 7.7 ms`
+
+Interpretation:
+
+- Phase 3 is working as intended:
+  - requests are now landing in a small number of stable bucket classes
+  - the benchmark script surfaces those bucket IDs directly
+- Phase 4 is working in a limited but real way:
+  - homogeneous batches are now graph-capturable
+  - replay removes most of the forward-call overhead for those exact shapes
+  - graph replay is not yet the dominant throughput win because only a subset
+    of batches in this benchmark are fully homogeneous
+- Phase 5 is only groundwork on this branch:
+  - the compiled scoring path currently hits an Inductor/TLS assertion in this
+    server context
+  - the runtime now catches that failure once, disables the compiled path, and
+    falls back to eager scoring without failing the request
+
+Current practical conclusion:
+
+- the combined Phase 3-5 slice improves the immediate clean baseline, mainly by
+  reducing `batch_exec_ms` and cutting the forward path again
+- the main remaining bottleneck is still the update stage inside
+  `_generate_iterative(...)`
+- the Triton work here should be considered a safe starting point, not the full
+  custom-kernel Phase 5 described below
+
 ### What These Results Tell Us
 
 The same-GPU 2-worker implementation is functioning correctly:
@@ -370,6 +443,518 @@ Current practical conclusions:
   `100 requests in 2s` target on a single `RTX 3090`
 - removing the batch limit entirely is unlikely to help much and is more likely
   to create very large batches with worse tail latency and higher OOM risk
+
+## Revised Roadmap For `100 Requests In 2 Seconds` With High Quality Output
+
+This is the current go-forward plan and should be treated as the primary
+roadmap from this point onward.
+
+The target is:
+
+- `100 concurrent requests`
+- finishing in about `2s`
+- at the preferred high-quality design-mode preset:
+  - `num_step=16`
+  - `guidance_scale=2.0`
+
+That target implies an aggregate throughput of about:
+
+- `50 req/s`
+
+Current reference points on this branch:
+
+| Scenario | Throughput | Gap To `50 req/s` |
+|---|---:|---:|
+| Best warmed high-quality run so far | `6.29 req/s` | `~7.95x short` |
+| Current Phase 3-5 branch | `5.21 req/s` | `~9.60x short` |
+| Lower-quality sweep (`num_step=8`, `guidance_scale=1.0`) | `11.53 req/s` | `~4.34x short` |
+
+This leads to an important planning conclusion:
+
+- on a single `RTX 3090`, software-only optimization is very unlikely to reach
+  `50 req/s` while keeping `num_step=16` and `guidance_scale=2.0`
+- the realistic strategy is:
+  1. raise the single-GPU ceiling as much as possible
+  2. then add more total GPU compute to actually hit the product target
+
+### What The Current Data Says
+
+At high-quality settings, the dominant remaining costs are still inside
+`_generate_iterative(...)`:
+
+- the forward path improved substantially after Phase 2 and again after the
+  Phase 3-5 slice
+- the current biggest remaining timed stage is the update path:
+  - `model_iterative_update_ms ~= 2661 ms`
+- the scoring path is still meaningful
+- CUDA Graph replay is only helping a subset of traffic because only
+  `18 / 100` requests in the validated run were part of exact-shape homogeneous
+  batches
+
+What is *not* the main problem right now:
+
+- HTTP thread limits
+- request validation / prep
+- WAV serialization
+- simply increasing `max_batch_requests`
+- removing `max_batch_prompts`
+
+Those knobs can affect latency or burst admission, but they are not the reason
+the server is still about an order of magnitude short of the throughput target.
+
+### New Phase Sequence
+
+The next phases should be executed in this order.
+
+### Phase A: Re-Baseline And Remove Self-Inflicted Regressions
+
+Goal:
+
+- make sure we are optimizing from the best current serving profile, not from a
+  partially regressed experimental branch
+
+Why this phase exists:
+
+- the best warmed high-quality run so far is still `6.29 req/s`
+- the current Phase 3-5 stack is more graph-friendly and better structured, but
+  only at `5.21 req/s`
+- before going deeper, we need to quantify how much throughput is being lost to:
+  - stricter bucketing
+  - reduced average batch size
+  - graph capture overhead on cold or partially warm paths
+
+Work items:
+
+- run a controlled ablation matrix on the current branch:
+  - current stack
+  - `--no-shape-bucketing`
+  - `--no-cuda-graphs`
+  - `--no-triton-score-fusion`
+- sweep current design-mode batch caps at `12`, `16`, `20`, `24`
+- record:
+  - average batch size
+  - exact-shape homogeneous rate
+  - graph capture rate
+  - graph replay rate
+- choose one clean default benchmark profile for later phases
+
+Success criteria:
+
+- we either recover or beat the `6.29 req/s` warmed high-quality result
+- or we have clear, quantified evidence about which experimental feature is
+  trading throughput for structure
+
+Expected impact:
+
+- low direct throughput gain
+- very high decision value
+
+### Phase B: Optimize The Update And Scoring Path
+
+Goal:
+
+- attack the largest remaining hot path after the forward pass improvements
+
+Why this is next:
+
+- the current branch already cut `model_iterative_forward_ms` down to
+  `~1493 ms`
+- the update stage is still about `~2661 ms`
+- if we do not reduce update/scoring cost, more graph work on the forward path
+  alone will not get us close to the target
+
+Work items:
+
+- keep more state flattened across steps instead of reshaping and reindexing
+  large tensors every iteration
+- reduce or eliminate repeated `permute(...)` and gather work when extracting
+  conditional and unconditional target logits
+- precompute per-step helper tensors outside the decode loop where possible
+- tighten the masked top-k and scatter-write path
+- prototype a fused CUDA/Triton kernel for:
+  - score transformation
+  - masked top-k selection
+  - sparse token writeback
+- only consider confidence-score approximations if parity on the saved quality
+  reference set is strong
+
+Success criteria:
+
+- `model_iterative_update_ms` becomes smaller than the forward path
+- combined `model_iterative_scoring_ms + model_iterative_update_ms` drops by at
+  least `2x` on the `16 / 2.0` design benchmark
+
+Expected impact:
+
+- high
+
+### Phase A Result: Current Stack Ablations
+
+Phase A was run on the current high-quality design-mode benchmark:
+
+```bash
+.venv/bin/python scripts/benchmark_api_batching.py \
+  --url http://127.0.0.1:8002/generate \
+  --requests 100 \
+  --concurrency 100 \
+  --launch-window-s 2 \
+  --mode design \
+  --num-step 16 \
+  --guidance-scale 2.0 \
+  --duration 4.0
+```
+
+Measured one-GPU serving variants:
+
+| Variant | Throughput | Mean Latency | Mean Batch Exec |
+|---|---:|---:|---:|
+| Current stack | `5.68 req/s` | `11289 ms` | `5053 ms` |
+| `--no-shape-bucketing` | `5.48 req/s` | `12096 ms` | `6856 ms` |
+| `--no-cuda-graphs` | `5.46 req/s` | `11802 ms` | `5302 ms` |
+| `--no-triton-score-fusion` | `5.49 req/s` | `11822 ms` | `5338 ms` |
+
+Interpretation:
+
+- the current stack is the best of the tested serving toggles on this branch
+- shape bucketing is helping even though it slightly reduces average batch size
+- CUDA Graph replay is helping enough to justify keeping it enabled
+- the current Triton scoring toggle is not a large gain, but disabling it still
+  did not improve the end-to-end benchmark
+
+Current Phase A decision:
+
+- keep:
+  - shape bucketing enabled
+  - CUDA Graph replay enabled
+  - the existing Triton scoring toggle enabled
+- do not spend more time trying to recover throughput by turning serving knobs
+  off
+
+### Phase B Result: First Update-Path Experiments
+
+Two first-pass update-path optimizations were prototyped and benchmarked:
+
+1. a flatter linear-index update path with more precomputed indexing metadata
+2. a compiled helper for the selection/update substep using
+   `torch.compile(..., options={\"triton.cudagraphs\": False})`
+
+Observed outcomes:
+
+- the flatter linear-index rewrite did **not** beat the current stack
+- the compiled helper reduced `model_iterative_update_ms` in isolation, but it
+  hurt end-to-end throughput in the real server because compile and shape
+  overhead outweighed the gain
+- both experiments were reverted from the serving hot path
+
+What stayed:
+
+- the branch now keeps finer-grained update telemetry so later iterations can
+  separate:
+  - `model_iterative_update_select_ms`
+  - `model_iterative_update_write_ms`
+
+Current Phase B conclusion:
+
+- the update path is still the right bottleneck to attack
+- but the next improvement likely needs to be more structural than a small
+  indexing rewrite
+- the most promising next Phase B directions are:
+  - a fused or compiled selection/write helper with stable shapes
+  - broader graph capture that includes more of the per-step body
+  - a custom Triton kernel for masked top-k plus sparse token writeback
+
+### Latest High-Quality Rerun After Phase B Telemetry Split
+
+A later rerun on the same high-quality benchmark produced a newer
+`batching-bench.csv` with the per-update substage timings enabled:
+
+- `model_iterative_update_ms`
+- `model_iterative_update_select_ms`
+- `model_iterative_update_write_ms`
+
+Important note:
+
+- the pasted console output did not include the top summary lines
+  (`Total wall time`, `Effective throughput`)
+- however, the CSV still lets us compare the run against the previous
+  high-quality Phase A baseline
+
+Observed metrics from the CSV:
+
+| Metric | Phase A Baseline | Latest Rerun |
+|---|---:|---:|
+| Mean latency | `11289 ms` | `9687 ms` |
+| Mean queue wait | `6205 ms` | `4590 ms` |
+| Mean batch exec | `5053 ms` | `5067 ms` |
+| Mean batch requests | `18.92` | `17.82` |
+| Peak GPU memory used mean | `14064 MB` | `13273 MB` |
+| Exact-shape homogeneous | `19` | `19` |
+
+Throughput implication:
+
+- from the CSV, the maximum observed `local_wall_ms` was about `14582 ms`
+- with a `2s` launch window, total wall time for the run must therefore be at
+  most about `16.58s`
+- that implies a throughput of at least about `6.03 req/s`
+- this is better than the earlier Phase A baseline of `5.68 req/s`
+
+New update substage timings from that rerun:
+
+| Timing Metric | Result |
+|---|---:|
+| `model_iterative_update_ms` mean | `2953 ms` |
+| `model_iterative_update_select_ms` mean | `6.6 ms` |
+| `model_iterative_update_write_ms` mean | `34.8 ms` |
+
+Interpretation:
+
+- this rerun appears to be a real improvement over the earlier `5.68 req/s`
+  Phase A baseline
+- latency and queueing improved materially
+- batch execution time stayed roughly flat
+- average batch size was slightly smaller, so the improvement is not coming
+  from simply packing more requests into each launch
+- the new substage timings strongly suggest that the expensive part of the
+  update block is **not** the final sparse write itself
+- instead, most of the true update cost is still tied to the selection /
+  synchronization path around masked top-k and data-dependent indexing
+
+### Phase C: Increase Shape Homogeneity And Graph Hit Rate
+
+Goal:
+
+- make graph replay apply to most traffic, not just the exact-shape minority
+
+Why this matters:
+
+- the current graph path is real, but only `18%` of responses in the validated
+  run were exact-shape homogeneous
+- exact-shape-only capture is too narrow to move total throughput enough
+
+Work items:
+
+- move from exact-shape-only graph capture toward bucket-level padded-shape
+  capture
+- capture by dominant padded bucket classes such as:
+  - target-token bucket
+  - conditioning-token bucket
+  - CFG on/off
+  - lane
+- pad requests to bucket maxima where the extra compute cost is smaller than the
+  benefit from graph reuse
+- optionally run separate queue lanes per dominant bucket instead of mixing them
+  inside the same worker queue
+- expand worker startup warmup to compile the dominant bucket shapes, not just a
+  single synthetic warmup
+
+Success criteria:
+
+- most requests fall into a small number of replayable bucket classes
+- graph-replayable batches become the common case instead of the exception
+- graph capture becomes rare after startup warmup
+
+Expected impact:
+
+- high
+
+### Phase D: Expand Graph Scope Beyond The Forward Call
+
+Goal:
+
+- replay more of the iterative step body, not just the transformer forward
+
+Why this matters:
+
+- today the graph scope mostly removes forward-call overhead
+- the remaining update and scoring work still runs outside the graph
+- after Phase B and Phase C, the step body should be static enough to broaden
+  graph coverage
+
+Work items:
+
+- capture the full iterative step for fixed padded buckets when shapes allow
+- evaluate full-loop capture for homogeneous fixed-length workloads
+- keep static buffers for:
+  - logits
+  - scores
+  - selected indices
+  - token writeback state
+- preserve eager fallbacks for mixed-shape traffic
+
+Success criteria:
+
+- graph replay covers most of the per-step hot path for stable buckets
+- Python overhead in the iterative loop becomes negligible in the hot case
+
+Expected impact:
+
+- medium to high
+
+### Phase E: Real Triton Kernel Fusion
+
+Goal:
+
+- cut bandwidth-heavy transformer and scoring overhead with custom kernels, not
+  just opportunistic `torch.compile(...)`
+
+Why this is still needed:
+
+- the current Phase 5 slice is only safe groundwork
+- the compiled scoring path still falls back to eager in this server context
+- if we want another material single-GPU gain, we need true fused kernels in
+  the model hot path
+
+Work items:
+
+- implement or port Triton kernels for:
+  - RMSNorm
+  - SwiGLU
+  - fused residual + norm
+- add a fused CFG scoring kernel for the design-mode hot path
+- benchmark against the saved multilingual quality references before enabling by
+  default
+- keep all kernel patches behind feature flags
+
+Success criteria:
+
+- stable warm serving with no eager fallback in the intended path
+- measurable end-to-end gain on the `16 / 2.0` benchmark beyond graphing alone
+
+Expected impact:
+
+- medium to high
+
+### Phase F: Scale Out To More Total GPU Compute
+
+Goal:
+
+- translate the single-GPU ceiling gains into the actual product throughput
+  target
+
+Why this phase is mandatory:
+
+- even an aggressive single-GPU optimization outcome is unlikely to reach
+  `50 req/s` on one `RTX 3090`
+- the target almost certainly requires more total GPU compute in addition to
+  software wins
+
+Work items:
+
+- generalize the backend from:
+  - `2 workers on 1 GPU`
+  - to `N workers across M GPUs`
+- keep the same batching and bucketing rules across replicas
+- add queue telemetry per GPU and per worker
+- benchmark aggregate throughput on:
+  - `2 GPUs`
+  - `4 GPUs`
+  - or stronger GPU classes if available
+
+Success criteria:
+
+- aggregate throughput at high quality reaches or exceeds `50 req/s`
+- p95 latency remains operationally acceptable under the `100 requests / 2s`
+  burst
+
+Expected impact:
+
+- essential for the final target
+
+### Phase G: Clone-Mode Specialization
+
+Goal:
+
+- keep clone traffic from destroying the design-mode throughput envelope
+
+Work items:
+
+- give clone requests distinct batch lanes and caps
+- enforce or strongly recommend shorter reference clips for high-throughput
+  workloads
+- surface prompt-cache hit/miss telemetry more clearly
+- build separate quality and throughput targets for clone mode
+
+Success criteria:
+
+- clone mode becomes predictable and isolated
+- design-mode traffic does not regress when clone traffic is present
+
+Expected impact:
+
+- medium operational gain
+
+### Phase H: TensorRT Evaluation
+
+Goal:
+
+- evaluate TensorRT only after the path is static enough to justify the effort
+
+Why this is late:
+
+- the current serving path still contains too much dynamic behavior
+- TensorRT will be easier to assess after:
+  - Phase B
+  - Phase C
+  - Phase D
+  - and at least part of Phase E
+
+Work items:
+
+- run Torch-TensorRT `dryrun=True` on the narrowed hot path
+- test coverage on the dominant padded buckets
+- compare build/maintenance cost against the Triton path
+
+Success criteria:
+
+- high coverage on the real serving hot path
+- clear evidence that TensorRT outperforms the Triton-based alternative enough
+  to justify adopting it
+
+Expected impact:
+
+- unknown until the path is more static
+
+### What We Should Not Prioritize Next
+
+The current data does **not** support spending major engineering time next on:
+
+- `api_thread_limit`
+- removing `max_batch_prompts`
+- unbounded batch sizes
+- request-validation overhead
+- WAV serialization
+- clone-mode work before design mode is faster
+
+Those may still matter operationally, but they are not the highest-ROI path to
+the throughput target.
+
+### Practical Execution Order
+
+The recommended order from today forward is:
+
+1. Phase A
+2. Phase B
+3. Phase C
+4. Phase D
+5. Phase E
+6. Phase F
+7. Phase G
+8. Phase H
+
+Operational rule:
+
+- do not start the next phase until the current one has:
+  - a controlled benchmark comparison
+  - a written conclusion in this document
+  - a clear decision about whether the phase stays enabled by default
+
+Most important planning rule:
+
+- treat single-GPU optimization and multi-GPU scale-out as **separate**
+  objectives
+- the first raises the ceiling
+- the second is what is most likely to actually deliver `100 requests in 2s`
+  at the desired quality bar
 
 ### Recommended Next Tests
 
@@ -1118,12 +1703,35 @@ Expected impact:
 
 - medium to high
 
+Historical note:
+
+- the original Phase `0-8` rollout below is preserved as implementation
+  history and background
+- use the **Revised Roadmap For `100 Requests In 2 Seconds` With High Quality
+  Output** above as the current go-forward plan
+
 ### Phase 3: Shape Bucketing
 
 Goal:
 
 - make inference shapes stable enough to benefit from graph replay and better
   kernel reuse
+
+Status:
+
+- implemented on this branch
+- each queued request now carries:
+  - a coarse shape bucket ID based on lane, CFG on/off, prompt-count bucket,
+    target-token bucket, and conditioning-length bucket
+  - an exact shape signature based on the request's concrete target and
+    conditioning lengths
+- batch selection now prefers exact-shape matches first, then falls back to
+  coarse bucket matches within the same generation-compatibility key
+- shape bucket IDs and exact-shape homogeneity flags are now emitted in:
+  - batch logs
+  - response headers
+  - benchmark CSV output
+  - benchmark summary output
 
 Work items:
 
@@ -1151,6 +1759,21 @@ Goal:
 
 - reduce kernel-launch and Python overhead for repeated fixed-shape forwards
 
+Status:
+
+- implemented experimentally on this branch for homogeneous exact-shape batches
+- the iterative path now:
+  - detects homogeneous batches where all requests share the same conditioning
+    and target lengths
+  - captures the iterative forward call into a CUDA Graph for those exact
+    shapes
+  - replays the graph on subsequent matching batches inside the same worker
+- graph capture and replay timings are now visible in stage telemetry when the
+  path is active
+- this is intentionally conservative:
+  - it only activates for homogeneous exact-shape batches
+  - it falls back to eager execution for mixed-shape batches or failed captures
+
 Work items:
 
 - add CUDA Graph capture keyed by the Phase 3 shape buckets
@@ -1171,6 +1794,17 @@ Expected impact:
 Goal:
 
 - reduce bandwidth-heavy transformer operator overhead
+
+Status:
+
+- partially started on this branch as low-risk groundwork, not as full custom
+  transformer kernel fusion
+- the scoring path now attempts to use a compiled Inductor/Triton version when
+  running on CUDA and when class sampling is disabled
+- runtime failures in that compiled path are now caught once and force a safe
+  eager fallback for the rest of the worker lifetime
+- full custom Triton kernels for RMSNorm / SwiGLU / fused residual+norm are
+  still pending
 
 Work items:
 

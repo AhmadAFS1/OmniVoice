@@ -56,6 +56,8 @@ class RequestResult:
     batch_exec_ms: float | None
     batch_requests: int | None
     batch_prompts: int | None
+    shape_bucket_id: str | None
+    exact_shape_homogeneous: bool | None
     batch_target_tokens: int | None
     batch_max_sequence_length: int | None
     batch_estimated_memory_mb: float | None
@@ -308,6 +310,8 @@ def run_one_request(args: argparse.Namespace, index: int, text: str) -> RequestR
             batch_exec_ms=None,
             batch_requests=None,
             batch_prompts=None,
+            shape_bucket_id=None,
+            exact_shape_homogeneous=None,
             batch_target_tokens=None,
             batch_max_sequence_length=None,
             batch_estimated_memory_mb=None,
@@ -344,6 +348,8 @@ def run_one_request(args: argparse.Namespace, index: int, text: str) -> RequestR
             batch_exec_ms=None,
             batch_requests=None,
             batch_prompts=None,
+            shape_bucket_id=None,
+            exact_shape_homogeneous=None,
             batch_target_tokens=None,
             batch_max_sequence_length=None,
             batch_estimated_memory_mb=None,
@@ -379,6 +385,10 @@ def run_one_request(args: argparse.Namespace, index: int, text: str) -> RequestR
         batch_exec_ms=_header_float(headers, "x-omnivoice-batch-exec-ms"),
         batch_requests=_header_int(headers, "x-omnivoice-batch-requests"),
         batch_prompts=_header_int(headers, "x-omnivoice-batch-prompts"),
+        shape_bucket_id=headers.get("x-omnivoice-shape-bucket"),
+        exact_shape_homogeneous=_header_bool(
+            headers, "x-omnivoice-exact-shape-homogeneous"
+        ),
         batch_target_tokens=_header_int(headers, "x-omnivoice-batch-target-tokens"),
         batch_max_sequence_length=_header_int(
             headers, "x-omnivoice-batch-max-sequence-length"
@@ -457,6 +467,8 @@ def write_csv(path: str, results: list[RequestResult]) -> None:
         "batch_exec_ms",
         "batch_requests",
         "batch_prompts",
+        "shape_bucket_id",
+        "exact_shape_homogeneous",
         "batch_target_tokens",
         "batch_max_sequence_length",
         "batch_estimated_memory_mb",
@@ -493,6 +505,8 @@ def write_csv(path: str, results: list[RequestResult]) -> None:
                 "batch_exec_ms": result.batch_exec_ms,
                 "batch_requests": result.batch_requests,
                 "batch_prompts": result.batch_prompts,
+                "shape_bucket_id": result.shape_bucket_id,
+                "exact_shape_homogeneous": result.exact_shape_homogeneous,
                 "batch_target_tokens": result.batch_target_tokens,
                 "batch_max_sequence_length": result.batch_max_sequence_length,
                 "batch_estimated_memory_mb": result.batch_estimated_memory_mb,
@@ -598,6 +612,35 @@ def print_summary(
             "Observed batch_requests histogram: "
             + ", ".join(
                 f"{batch_size}=>{count}" for batch_size, count in sorted(batch_hist.items())
+            )
+        )
+
+    shape_bucket_hist: dict[str, int] = {}
+    for result in successes:
+        if result.shape_bucket_id:
+            shape_bucket_hist[result.shape_bucket_id] = (
+                shape_bucket_hist.get(result.shape_bucket_id, 0) + 1
+            )
+    if shape_bucket_hist:
+        print(
+            "Shape bucket distribution: "
+            + ", ".join(
+                f"{bucket_id}=>{count}"
+                for bucket_id, count in sorted(shape_bucket_hist.items())
+            )
+        )
+
+    exact_shape_hist: dict[str, int] = {}
+    for result in successes:
+        if result.exact_shape_homogeneous is None:
+            continue
+        key = "true" if result.exact_shape_homogeneous else "false"
+        exact_shape_hist[key] = exact_shape_hist.get(key, 0) + 1
+    if exact_shape_hist:
+        print(
+            "Exact shape homogeneous: "
+            + ", ".join(
+                f"{key}=>{count}" for key, count in sorted(exact_shape_hist.items())
             )
         )
 

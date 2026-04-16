@@ -45,6 +45,9 @@ class GenerationBatcherConfig:
     """Tuning knobs for online API micro-batching."""
 
     collect_ms: float = 10.0
+    shape_bucketing_enabled: bool = True
+    shape_bucket_target_tokens: int = 16
+    shape_bucket_conditioning_tokens: int = 32
     max_batch_requests: int = 32
     max_batch_prompts: int = 32
     max_total_target_tokens: int = 4096
@@ -60,6 +63,8 @@ class PendingGenerationResult:
     """Result returned to one queued API request."""
 
     audios: list[torch.Tensor]
+    shape_bucket_id: Optional[str]
+    exact_shape_homogeneous: bool
     batch_requests: int
     batch_prompts: int
     batch_target_tokens: int
@@ -83,6 +88,8 @@ class PendingGeneration:
     generation_config: OmniVoiceGenerationConfig
     postprocess_flags: list[bool]
     estimated_sequence_lengths: list[int]
+    shape_bucket_id: Optional[str]
+    exact_shape_signature: str
     future: Future = field(default_factory=Future)
 
     @property
@@ -104,6 +111,59 @@ class PendingGeneration:
     @property
     def max_sequence_length(self) -> int:
         return max(self.estimated_sequence_lengths) if self.estimated_sequence_lengths else 0
+
+
+def _round_up_to_multiple(value: int, step: int) -> int:
+    step = max(1, int(step))
+    value = max(1, int(value))
+    return int(((value + step - 1) // step) * step)
+
+
+def _bucketize_prompt_count(prompt_count: int) -> int:
+    prompt_count = max(1, int(prompt_count))
+    bucket = 1
+    while bucket < prompt_count:
+        bucket <<= 1
+    return bucket
+
+
+def build_generation_shape_bucket_id(
+    *,
+    lane: str,
+    guidance_scale: float,
+    prompt_count: int,
+    estimated_sequence_lengths: list[int],
+    target_lens: list[int],
+    conditioning_bucket_tokens: int,
+    target_bucket_tokens: int,
+) -> str:
+    max_conditioning = max(estimated_sequence_lengths) if estimated_sequence_lengths else 1
+    max_target = max(target_lens) if target_lens else 1
+    prompt_bucket = _bucketize_prompt_count(prompt_count)
+    conditioning_bucket = _round_up_to_multiple(
+        max_conditioning,
+        conditioning_bucket_tokens,
+    )
+    target_bucket = _round_up_to_multiple(
+        max_target,
+        target_bucket_tokens,
+    )
+    guidance_bucket = "cfg" if float(guidance_scale) != 0.0 else "nog"
+    return (
+        f"{lane}|{guidance_bucket}|p{prompt_bucket}|"
+        f"t{target_bucket}|c{conditioning_bucket}"
+    )
+
+
+def build_generation_shape_signature(
+    *,
+    prompt_count: int,
+    estimated_sequence_lengths: list[int],
+    target_lens: list[int],
+) -> str:
+    conditioning_part = ",".join(str(int(length)) for length in estimated_sequence_lengths)
+    target_part = ",".join(str(int(length)) for length in target_lens)
+    return f"p{int(prompt_count)}|c[{conditioning_part}]|t[{target_part}]"
 
 
 class ClonePromptCache:
@@ -485,6 +545,9 @@ class GenerationBatcher:
         current_free = self._current_free_memory_bytes()
         return {
             "collect_ms": self._config.collect_ms,
+            "shape_bucketing_enabled": self._config.shape_bucketing_enabled,
+            "shape_bucket_target_tokens": self._config.shape_bucket_target_tokens,
+            "shape_bucket_conditioning_tokens": self._config.shape_bucket_conditioning_tokens,
             "max_batch_requests": self._config.max_batch_requests,
             "max_batch_prompts": self._config.max_batch_prompts,
             "max_total_target_tokens": self._config.max_total_target_tokens,
@@ -569,6 +632,7 @@ class GenerationBatcher:
         anchor = self._pending[0]
         memory_budget_bytes = self._current_memory_budget_bytes()
         selected_indices = [0]
+        selected_index_set = {0}
         batch_requests = 1
         batch_prompts = anchor.prompt_count
         target_tokens = anchor.target_token_count
@@ -582,11 +646,17 @@ class GenerationBatcher:
             anchor.generation_config.guidance_scale,
         )
 
-        for index in range(1, len(self._pending)):
-            candidate = self._pending[index]
-            if candidate.batch_key != anchor.batch_key:
-                continue
+        def try_include(index: int) -> bool:
+            nonlocal batch_requests
+            nonlocal batch_prompts
+            nonlocal target_tokens
+            nonlocal conditioning_tokens
+            nonlocal max_sequence_length
+            nonlocal sequence_lengths
+            nonlocal target_lengths
+            nonlocal estimated_batch_memory_bytes
 
+            candidate = self._pending[index]
             next_requests = batch_requests + candidate.request_count
             next_prompts = batch_prompts + candidate.prompt_count
             next_target_tokens = target_tokens + candidate.target_token_count
@@ -610,22 +680,23 @@ class GenerationBatcher:
             )
 
             if next_requests > self._config.max_batch_requests:
-                continue
+                return False
             if next_prompts > self._config.max_batch_prompts:
-                continue
+                return False
             if next_target_tokens > self._config.max_total_target_tokens:
-                continue
+                return False
             if next_conditioning_tokens > self._config.max_total_conditioning_tokens:
-                continue
+                return False
             if padding_ratio > self._config.max_padding_ratio:
-                continue
+                return False
             if (
                 memory_budget_bytes is not None
                 and next_estimated_batch_memory_bytes > memory_budget_bytes
             ):
-                continue
+                return False
 
             selected_indices.append(index)
+            selected_index_set.add(index)
             batch_requests = next_requests
             batch_prompts = next_prompts
             target_tokens = next_target_tokens
@@ -634,12 +705,31 @@ class GenerationBatcher:
             sequence_lengths = next_sequence_lengths
             target_lengths = next_target_lengths
             estimated_batch_memory_bytes = next_estimated_batch_memory_bytes
+            return True
 
+        def is_bucket_compatible(candidate: PendingGeneration) -> bool:
+            if candidate.batch_key != anchor.batch_key:
+                return False
+            if not self._config.shape_bucketing_enabled:
+                return True
+            return candidate.shape_bucket_id == anchor.shape_bucket_id
+
+        for exact_only in (True, False):
+            for index in range(1, len(self._pending)):
+                if index in selected_index_set:
+                    continue
+                candidate = self._pending[index]
+                if not is_bucket_compatible(candidate):
+                    continue
+                if exact_only and candidate.exact_shape_signature != anchor.exact_shape_signature:
+                    continue
+                if try_include(index) and batch_requests >= self._config.max_batch_requests:
+                    break
             if batch_requests >= self._config.max_batch_requests:
                 break
 
         jobs = [self._pending[index] for index in selected_indices]
-        for index in reversed(selected_indices):
+        for index in sorted(selected_indices, reverse=True):
             self._pending.pop(index)
         return jobs
 
@@ -692,6 +782,10 @@ class GenerationBatcher:
             batch_exec_ms = (time.perf_counter() - batch_started) * 1000.0
             batch_requests = len(jobs)
             batch_prompts = merged_task.batch_size
+            shape_bucket_id = jobs[0].shape_bucket_id
+            exact_shape_homogeneous = (
+                len({job.exact_shape_signature for job in jobs}) == 1
+            )
             batch_target_tokens = sum(merged_task.target_lens)
             batch_max_sequence_length = max(
                 (
@@ -724,6 +818,8 @@ class GenerationBatcher:
                 job.future.set_result(
                     PendingGenerationResult(
                         audios=job_audios,
+                        shape_bucket_id=shape_bucket_id,
+                        exact_shape_homogeneous=exact_shape_homogeneous,
                         batch_requests=batch_requests,
                         batch_prompts=batch_prompts,
                         batch_target_tokens=batch_target_tokens,
@@ -742,6 +838,8 @@ class GenerationBatcher:
                 self._last_batch_summary = {
                     "batch_requests": batch_requests,
                     "batch_prompts": batch_prompts,
+                    "shape_bucket_id": shape_bucket_id,
+                    "exact_shape_homogeneous": exact_shape_homogeneous,
                     "batch_target_tokens": batch_target_tokens,
                     "batch_max_sequence_length": batch_max_sequence_length,
                     "estimated_batch_memory_mb": round(estimated_batch_memory_mb, 2),
@@ -766,11 +864,13 @@ class GenerationBatcher:
                 }
 
             logger.info(
-                "[%s] batch status=success requests=%d prompts=%d lane=%s exec_ms=%.2f target_tokens=%d max_sequence_length=%d est_mem_mb=%.2f gpu_peak_util_pct=%s gpu_peak_used_mb=%s gpu_free_before_mb=%s gpu_free_after_mb=%s torch_alloc_mb=%s torch_reserved_mb=%s torch_peak_alloc_mb=%s torch_peak_reserved_mb=%s stage_timings_ms=%s",
+                "[%s] batch status=success requests=%d prompts=%d lane=%s shape_bucket=%s exact_shape_homogeneous=%s exec_ms=%.2f target_tokens=%d max_sequence_length=%d est_mem_mb=%.2f gpu_peak_util_pct=%s gpu_peak_used_mb=%s gpu_free_before_mb=%s gpu_free_after_mb=%s torch_alloc_mb=%s torch_reserved_mb=%s torch_peak_alloc_mb=%s torch_peak_reserved_mb=%s stage_timings_ms=%s",
                 self._name,
                 batch_requests,
                 batch_prompts,
                 jobs[0].batch_key.lane,
+                shape_bucket_id,
+                exact_shape_homogeneous,
                 batch_exec_ms,
                 batch_target_tokens,
                 batch_max_sequence_length,

@@ -203,6 +203,9 @@ The `/generate` endpoint accepts:
 - `ref_text`
 - `num_step`
 - `guidance_scale`
+- `layer_penalty_factor`
+- `position_temperature`
+- `class_temperature`
 - `speed`
 - `duration`
 - `denoise`
@@ -214,8 +217,28 @@ Some details:
 
 - `text` is always required.
 - `duration` must be greater than `0` if provided.
+- `position_temperature` must be greater than or equal to `0` if provided.
+- `class_temperature` must be greater than or equal to `0` if provided.
 - `speed` is only forwarded if it differs from `1.0`.
 - `language="Auto"` or blank is normalized to `None`.
+- `position_temperature=0.0` makes mask-position selection deterministic.
+- `class_temperature=0.0` keeps token selection greedy and deterministic.
+
+For more stable repeated calls without forcing an exact output length, try
+omitting `duration` and lowering both temperatures:
+
+```bash
+curl -sS \
+  -X POST http://127.0.0.1:8002/generate \
+  -F 'mode=design' \
+  -F 'text=Hello, this is a consistency check without a forced duration.' \
+  -F 'instruct=female, low pitch, british accent' \
+  -F 'num_step=16' \
+  -F 'guidance_scale=2.0' \
+  -F 'position_temperature=0.0' \
+  -F 'class_temperature=0.0' \
+  -o stable-no-duration.wav
+```
 
 Relevant code:
 

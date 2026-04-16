@@ -89,6 +89,63 @@ class VoiceClonePrompt:
     ref_rms: float
 
 
+@dataclass(frozen=True)
+class _IterativeForwardGraphKey:
+    effective_batch: int
+    seq_len: int
+    conditioning_len: int
+    target_len: int
+    guidance_enabled: bool
+
+
+class _IterativeForwardGraphRunner:
+    def __init__(
+        self,
+        model: "OmniVoice",
+        *,
+        input_ids: torch.Tensor,
+        audio_mask: torch.Tensor,
+        attention_mask,
+    ) -> None:
+        self._model = model
+        self._device = input_ids.device
+        self._attention_mask = attention_mask
+        self._static_input_ids = input_ids.clone()
+        self._static_audio_mask = audio_mask.clone()
+        self._graph = torch.cuda.CUDAGraph()
+        self._static_logits: Optional[torch.Tensor] = None
+
+        torch.cuda.synchronize(self._device)
+        capture_stream = torch.cuda.Stream(device=self._device)
+        capture_stream.wait_stream(torch.cuda.current_stream(device=self._device))
+        with torch.cuda.stream(capture_stream):
+            self._static_logits = self._model(
+                input_ids=self._static_input_ids,
+                audio_mask=self._static_audio_mask,
+                attention_mask=self._attention_mask,
+            ).logits
+        torch.cuda.current_stream(device=self._device).wait_stream(capture_stream)
+        torch.cuda.synchronize(self._device)
+
+        with torch.cuda.graph(self._graph):
+            self._static_logits = self._model(
+                input_ids=self._static_input_ids,
+                audio_mask=self._static_audio_mask,
+                attention_mask=self._attention_mask,
+            ).logits
+
+    def replay(
+        self,
+        input_ids: torch.Tensor,
+        audio_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        self._static_input_ids.copy_(input_ids)
+        self._static_audio_mask.copy_(audio_mask)
+        self._graph.replay()
+        assert self._static_logits is not None
+        return self._static_logits
+
+
 @dataclass
 class OmniVoiceGenerationConfig:
     num_step: int = 32
@@ -227,6 +284,28 @@ class OmniVoice(PreTrainedModel):
         self.duration_estimator = None
         self.sampling_rate = None
         self._asr_pipe = None
+        self._iterative_forward_graphs_enabled = True
+        self._iterative_forward_graph_min_batch_size = 4
+        self._iterative_forward_graph_cache: dict[
+            _IterativeForwardGraphKey, _IterativeForwardGraphRunner
+        ] = {}
+        self._iterative_forward_graph_disabled_keys: set[_IterativeForwardGraphKey] = set()
+        self._triton_score_fusion_enabled = True
+        self._triton_score_fusion_failed = False
+        self._compiled_predict_tokens_with_scoring = None
+
+    def set_inference_optimizations(
+        self,
+        *,
+        enable_cuda_graphs: bool = True,
+        cuda_graph_min_batch_size: int = 4,
+        enable_triton_score_fusion: bool = True,
+    ) -> None:
+        self._iterative_forward_graphs_enabled = bool(enable_cuda_graphs)
+        self._iterative_forward_graph_min_batch_size = max(
+            1, int(cuda_graph_min_batch_size)
+        )
+        self._triton_score_fusion_enabled = bool(enable_triton_score_fusion)
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
@@ -455,6 +534,70 @@ class OmniVoice(PreTrainedModel):
             loss=loss,
             logits=audio_logits,
         )
+
+    def _get_iterative_forward_graph_runner(
+        self,
+        *,
+        key: _IterativeForwardGraphKey,
+        input_ids: torch.Tensor,
+        audio_mask: torch.Tensor,
+        attention_mask,
+        _profile: Optional[dict[str, float]] = None,
+    ) -> Optional[_IterativeForwardGraphRunner]:
+        if not self._iterative_forward_graphs_enabled:
+            return None
+        if not str(self.device).startswith("cuda"):
+            return None
+        if key in self._iterative_forward_graph_disabled_keys:
+            return None
+
+        runner = self._iterative_forward_graph_cache.get(key)
+        if runner is not None:
+            return runner
+
+        capture_started = time.perf_counter()
+        try:
+            runner = _IterativeForwardGraphRunner(
+                self,
+                input_ids=input_ids,
+                audio_mask=audio_mask,
+                attention_mask=attention_mask,
+            )
+        except Exception:
+            logger.exception("Failed to capture iterative forward CUDA graph for %s", key)
+            self._iterative_forward_graph_disabled_keys.add(key)
+            return None
+
+        self._iterative_forward_graph_cache[key] = runner
+        add_timing(
+            _profile,
+            "model_iterative_graph_capture_ms",
+            (time.perf_counter() - capture_started) * 1000.0,
+        )
+        return runner
+
+    def _get_compiled_predict_tokens_with_scoring(self):
+        if not self._triton_score_fusion_enabled:
+            return None
+        if self._triton_score_fusion_failed:
+            return None
+        if not str(self.device).startswith("cuda"):
+            return None
+        if self._compiled_predict_tokens_with_scoring is not None:
+            return self._compiled_predict_tokens_with_scoring
+
+        try:
+            self._compiled_predict_tokens_with_scoring = torch.compile(
+                _predict_tokens_with_scoring_compiled,
+                mode="reduce-overhead",
+                dynamic=False,
+            )
+        except Exception:
+            logger.exception("Failed to compile Triton scoring kernel path")
+            self._triton_score_fusion_failed = True
+            return None
+
+        return self._compiled_predict_tokens_with_scoring
 
     def supported_language_ids(self) -> set[str]:
         """Return a list of supported language IDs."""
@@ -1612,7 +1755,6 @@ class OmniVoice(PreTrainedModel):
                     target_positions.view(1, 1, -1)
                     < target_lens_tensor.view(B, 1, 1)
                 )
-                valid_target_mask_bt = valid_target_mask.squeeze(1).unsqueeze(-1)
                 batch_row_idx = torch.arange(B, device=self.device).view(B, 1)
                 cond_target_positions = (
                     c_lens_tensor.view(B, 1)
@@ -1623,6 +1765,27 @@ class OmniVoice(PreTrainedModel):
                     target_positions.view(1, -1),
                     (target_lens_tensor - 1).clamp_min(0).view(B, 1),
                 )
+                graph_runner = None
+                homogeneous_lengths = (
+                    B >= self._iterative_forward_graph_min_batch_size
+                    and len(set(c_lens)) == 1
+                    and len(set(task.target_lens)) == 1
+                )
+                if homogeneous_lengths and type(batch_attention_mask).__name__ == "BlockMask":
+                    graph_key = _IterativeForwardGraphKey(
+                        effective_batch=2 * B,
+                        seq_len=max_c_len,
+                        conditioning_len=int(c_lens[0]),
+                        target_len=int(task.target_lens[0]),
+                        guidance_enabled=bool(gen_config.guidance_scale != 0.0),
+                    )
+                    graph_runner = self._get_iterative_forward_graph_runner(
+                        key=graph_key,
+                        input_ids=batch_input_ids,
+                        audio_mask=batch_audio_mask,
+                        attention_mask=batch_attention_mask,
+                        _profile=_profile,
+                    )
 
             for step in range(gen_config.num_step):
                 with timed_stage(
@@ -1630,11 +1793,23 @@ class OmniVoice(PreTrainedModel):
                     "model_iterative_forward_ms",
                     "omnivoice.iterative.forward",
                 ):
-                    batch_logits = self(
-                        input_ids=batch_input_ids,
-                        audio_mask=batch_audio_mask,
-                        attention_mask=batch_attention_mask,
-                    ).logits.to(torch.float32)
+                    if graph_runner is not None:
+                        replay_started = time.perf_counter()
+                        batch_logits = graph_runner.replay(
+                            batch_input_ids,
+                            batch_audio_mask,
+                        ).to(torch.float32)
+                        add_timing(
+                            _profile,
+                            "model_iterative_graph_replay_ms",
+                            (time.perf_counter() - replay_started) * 1000.0,
+                        )
+                    else:
+                        batch_logits = self(
+                            input_ids=batch_input_ids,
+                            audio_mask=batch_audio_mask,
+                            attention_mask=batch_attention_mask,
+                        ).logits.to(torch.float32)
 
                 scoring_started = time.perf_counter()
                 cond_logits = (
@@ -1654,7 +1829,7 @@ class OmniVoice(PreTrainedModel):
                     cond_logits, u_logits, gen_config
                 )
 
-                scores = scores - (layer_ids * gen_config.layer_penalty_factor)
+                scores = scores - layer_ids * gen_config.layer_penalty_factor
 
                 if gen_config.position_temperature > 0.0:
                     scores = _gumbel_sample(scores, gen_config.position_temperature)
@@ -1674,36 +1849,57 @@ class OmniVoice(PreTrainedModel):
                     flat_scores = scores.reshape(B, -1)
                     flat_pred_tokens = pred_tokens.reshape(B, -1)
                     flat_tokens = tokens.reshape(B, -1)
-
-                    _, topk_idx = torch.topk(flat_scores, k=max_step_k, dim=1)
+                    select_started = time.perf_counter()
+                    topk_scores, topk_idx = torch.topk(
+                        flat_scores,
+                        k=max_step_k,
+                        dim=1,
+                        sorted=False,
+                    )
+                    topk_values = torch.take_along_dim(
+                        flat_pred_tokens, topk_idx, dim=1
+                    )
                     active_topk_mask = (
                         torch.arange(max_step_k, device=self.device).view(1, -1)
                         < step_ks.view(B, 1)
                     )
-                    update_mask = torch.zeros_like(flat_scores, dtype=torch.bool)
-                    update_mask.scatter_(1, topk_idx, active_topk_mask)
-                    flat_tokens = torch.where(
-                        update_mask,
-                        flat_pred_tokens,
-                        flat_tokens,
+                    active_topk_mask &= torch.isfinite(topk_scores)
+                    add_timing(
+                        _profile,
+                        "model_iterative_update_select_ms",
+                        (time.perf_counter() - select_started) * 1000.0,
                     )
+                    if active_topk_mask.any():
+                        write_started = time.perf_counter()
+                        active_rows, active_cols = torch.nonzero(
+                            active_topk_mask, as_tuple=True
+                        )
+                        active_flat_idx = topk_idx[active_rows, active_cols]
+                        active_values = topk_values[active_rows, active_cols]
+                        flat_tokens[active_rows, active_flat_idx] = active_values
+                        codebook_idx = torch.div(
+                            active_flat_idx,
+                            max_target_len,
+                            rounding_mode="floor",
+                        )
+                        token_time_idx = active_flat_idx.remainder(max_target_len)
+                        batch_input_ids[
+                            B + active_rows,
+                            codebook_idx,
+                            token_time_idx,
+                        ] = active_values
+                        cond_seq_idx = cond_target_positions[active_rows, token_time_idx]
+                        batch_input_ids[
+                            active_rows,
+                            codebook_idx,
+                            cond_seq_idx,
+                        ] = active_values
+                        add_timing(
+                            _profile,
+                            "model_iterative_update_write_ms",
+                            (time.perf_counter() - write_started) * 1000.0,
+                        )
                     tokens = flat_tokens.view_as(tokens)
-
-                    uncond_inputs = batch_input_ids[B:, :, :max_target_len]
-                    batch_input_ids[B:, :, :max_target_len] = torch.where(
-                        valid_target_mask,
-                        tokens,
-                        uncond_inputs,
-                    )
-
-                    cond_view = batch_input_ids[:B].permute(0, 2, 1)
-                    token_view = tokens.permute(0, 2, 1)
-                    current_cond = cond_view[batch_row_idx, cond_target_positions]
-                    cond_view[batch_row_idx, cond_target_positions] = torch.where(
-                        valid_target_mask_bt,
-                        token_view,
-                        current_cond,
-                    )
                 add_timing(
                     _profile,
                     "model_iterative_update_ms",
@@ -1713,6 +1909,24 @@ class OmniVoice(PreTrainedModel):
             return [tokens[i, :, : task.target_lens[i]] for i in range(B)]
 
     def _predict_tokens_with_scoring(self, c_logits, u_logits, gen_config):
+        compiled_scoring = None
+        if gen_config.class_temperature <= 0.0:
+            compiled_scoring = self._get_compiled_predict_tokens_with_scoring()
+        if compiled_scoring is not None:
+            try:
+                return compiled_scoring(
+                    c_logits,
+                    u_logits,
+                    float(gen_config.guidance_scale),
+                    int(self.config.audio_mask_id),
+                )
+            except Exception:
+                logger.exception(
+                    "Compiled Triton scoring path failed; falling back to eager scoring"
+                )
+                self._triton_score_fusion_failed = True
+                self._compiled_predict_tokens_with_scoring = None
+
         if gen_config.guidance_scale != 0:
             c_log_probs = F.log_softmax(c_logits, dim=-1)
             u_log_probs = F.log_softmax(u_logits, dim=-1)
@@ -1745,6 +1959,28 @@ class OmniVoice(PreTrainedModel):
 
 def _get_packed_mask(document_ids):
     return partial(_mask_mod_packed, document_ids)
+
+
+def _predict_tokens_with_scoring_compiled(
+    c_logits: torch.Tensor,
+    u_logits: torch.Tensor,
+    guidance_scale: float,
+    audio_mask_id: int,
+):
+    if guidance_scale != 0.0:
+        c_log_probs = F.log_softmax(c_logits, dim=-1)
+        u_log_probs = F.log_softmax(u_logits, dim=-1)
+        log_probs = torch.log_softmax(
+            c_log_probs + guidance_scale * (c_log_probs - u_log_probs),
+            dim=-1,
+        )
+    else:
+        log_probs = F.log_softmax(c_logits, dim=-1)
+
+    log_probs[..., audio_mask_id] = -float("inf")
+    pred_tokens = log_probs.argmax(dim=-1)
+    confidence_scores = log_probs.max(dim=-1)[0]
+    return pred_tokens, confidence_scores
 
 
 def _mask_mod_packed(document_ids, b, h, q_idx, kv_idx):
